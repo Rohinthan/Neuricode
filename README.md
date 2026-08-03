@@ -14,24 +14,21 @@
 - **SIMD-Accelerated**:(AVX2 / ARM NEON / Unrolled Scalar) Tiled Matrix Multiplication
 - **Precomputed RoPE**: (Rotary Position Embeddings) Cos/Sin Lookup Tables
 - **Optimized KV-Cache**: Layout for Contiguous Sequential Memory Prefetching
-- Strict 64-Byte Aligned Memory Allocations via neuralc_aligned_alloc
-    1. Numerically Stable Softmax and RMSNorm (Log-Sum-Exp / Epsilon / NaN Guards)
-    2. Debug Mode & Tensor Validation (NaN / Inf Diagnostics)
-    3. Pretrained Binary Weight Loading & Saving API
-    4. Multi-Token Batch Forward Inference Engine
-    5. INT8 (Q8_0) Quantization Support for Ultra-Low Footprint Inference
-
-  - **Support**: HIGH-END / LOW END MICROKERNEL'S
-  - Added Feature in control to change the RNN / Transformer Via TUI and,
-  - Added in Config menu "Transformer Engine Setup"
-      - Vocabulary size
-      - Hidden Dimension
-      - FFN Expansion Dim
-      - Number of LAyers
-      - Number of Heads
-      - Max context Length
-
-
+- **Strict**: 64-Byte Aligned Memory Allocations via neuralc_aligned_alloc
+- **Numerically Stable**: Softmax and RMSNorm (Log-Sum-Exp / Epsilon / NaN Guards)
+- **Debug Mode & Tensor Validation** (NaN / Inf Diagnostics)
+- **Pretrained**: Binary Weight Loading & Saving API
+- **Multi-Token**: Batch Forward Inference Engine
+- **INT8 (Q8_0) Quantization**: Support for Ultra-Low Footprint Inference
+- **Support**: HIGH-END / LOW END MICROKERNEL'S
+- **Added Feature** control to change the RNN / Transformer Via TUI and,
+- **Added in Config menu Transformer Engine Setup**
+    - Vocabulary size
+    - Hidden Dimension
+    - FFN Expansion Dim
+    - Number of LAyers
+    - Number of Heads
+    - Max context Length
 
 
 ---
