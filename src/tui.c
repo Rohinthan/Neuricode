@@ -25,7 +25,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_PURPLE_CLASSIC] = {
         .name      = "Classic Purple (Default)",
         .primary   = NEON_PURPLE,
-        .secondary = NEON_MAGENTA,
         .prompt    = NEON_PURPLE,
         .text      = "\033[37m",
         .muted     = NEON_PURPLE
@@ -33,7 +32,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_CYBERPUNK] = {
         .name      = "Cyberpunk Cyan",
         .primary   = NEON_CYAN,
-        .secondary = NEON_MAGENTA,
         .prompt    = NEON_CYAN,
         .text      = "\033[37m",
         .muted     = NEON_CYAN
@@ -41,7 +39,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_MATRIX] = {
         .name      = "Matrix Green",
         .primary   = NEON_GREEN,
-        .secondary = NEON_YELLOW,
         .prompt    = NEON_GREEN,
         .text      = "\033[37m",
         .muted     = NEON_GREEN
@@ -49,7 +46,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_SUNSET_ORANGE] = {
         .name      = "Sunset Orange",
         .primary   = NEON_ORANGE,
-        .secondary = NEON_YELLOW,
         .prompt    = NEON_ORANGE,
         .text      = "\033[37m",
         .muted     = NEON_ORANGE
@@ -57,7 +53,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_ELECTRIC_BLUE] = {
         .name      = "Electric Blue",
         .primary   = NEON_BLUE,
-        .secondary = NEON_CYAN,
         .prompt    = NEON_BLUE,
         .text      = "\033[37m",
         .muted     = NEON_BLUE
@@ -65,7 +60,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_CRIMSON_RED] = {
         .name      = "Crimson Red",
         .primary   = NEON_RED,
-        .secondary = NEON_MAGENTA,
         .prompt    = NEON_RED,
         .text      = "\033[37m",
         .muted     = NEON_RED
@@ -73,7 +67,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_EMERALD_MINT] = {
         .name      = "Emerald Mint",
         .primary   = NEON_MINT,
-        .secondary = NEON_CYAN,
         .prompt    = NEON_MINT,
         .text      = "\033[37m",
         .muted     = NEON_MINT
@@ -81,7 +74,6 @@ static Theme g_themes[THEME_COUNT] = {
     [THEME_MONOCHROME_DARK] = {
         .name      = "Monochrome Dark",
         .primary   = COLOR_SILVER,
-        .secondary = COLOR_DARK_GRAY,
         .prompt    = COLOR_SILVER,
         .text      = "\033[37m",
         .muted     = COLOR_DARK_GRAY
@@ -93,6 +85,39 @@ static struct termios g_orig_termios;
 static bool g_raw_mode_active = false;
 static int g_cached_width = 0;
 
+static const char *get_theme_config_path(char *buf, size_t sz) {
+    const char *home = getenv("HOME");
+    if (!home) home = ".";
+    snprintf(buf, sz, "%s/.neuricode_theme", home);
+    return buf;
+}
+
+void tui_load_theme_config(void) {
+    char path[1024];
+    get_theme_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (f) {
+        int id = 0;
+        if (fscanf(f, "%d", &id) == 1) {
+            if (id >= 0 && id < THEME_COUNT) {
+                g_current_theme_id = (ThemeID)id;
+            }
+        }
+        fclose(f);
+    }
+}
+
+void tui_save_theme_config(ThemeID id) {
+    if (id >= THEME_COUNT) return;
+    char path[1024];
+    get_theme_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%d\n", (int)id);
+        fclose(f);
+    }
+}
+
 const Theme *tui_get_theme(void) {
     return &g_themes[g_current_theme_id];
 }
@@ -100,6 +125,7 @@ const Theme *tui_get_theme(void) {
 void tui_set_theme(ThemeID id) {
     if (id < THEME_COUNT) {
         g_current_theme_id = id;
+        tui_save_theme_config(id);
     }
 }
 
@@ -136,6 +162,7 @@ static void handle_sigwinch(int sig) {
 
 void tui_init(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    tui_load_theme_config();
     tui_update_terminal_size();
     signal(SIGWINCH, handle_sigwinch);
 }
@@ -183,26 +210,157 @@ void tui_print_header_banner(const char *version, const char *model_name) {
     int width = tui_get_terminal_width();
 
     printf("\n");
-    printf("%s%s  ███╗   ██╗███████╗██╗   ██╗██████╗ ██╗  ██████╗  ██████╗ ██████╗ ███████╗%s\n", ANSI_BOLD, th->primary, ANSI_RESET);
-    printf("%s%s  ████╗  ██║██╔════╝██║   ██║██╔══██╗██║ ██╔════╝ ██╔═══██╗██╔══██╗██╔════╝%s\n", ANSI_BOLD, th->primary, ANSI_RESET);
-    printf("%s%s  ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║ ██║      ██║   ██║██║  ██║█████╗  %s\n", ANSI_BOLD, th->secondary, ANSI_RESET);
-    printf("%s%s  ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║ ██║      ██║   ██║██║  ██║██╔══╝  %s\n", ANSI_BOLD, th->secondary, ANSI_RESET);
-    printf("%s%s  ██║ ╚████║███████╗╚██████╔╝██║  ██║██║ ╚██████╗ ╚██████╔╝██████╔╝███████╗%s\n", ANSI_BOLD, th->primary, ANSI_RESET);
-    printf("%s%s  ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝%s\n", ANSI_BOLD, th->primary, ANSI_RESET);
+    printf("%s%s         /\\_/\\         %s\n", ANSI_BOLD, NEON_CYAN, ANSI_RESET);
+    printf("%s%s        ( o.o )        %s\n", ANSI_BOLD, NEON_CYAN, ANSI_RESET);
+    printf("%s%s         > ^ <         %s\n", ANSI_BOLD, NEON_CYAN, ANSI_RESET);
+    printf("\n");
+    printf("     %s%sNeuricode CLI 1.1.0%s\n", ANSI_BOLD, th->primary, ANSI_RESET);
     printf("\n");
 
     printf("%s", th->muted);
     for (int i = 0; i < width; i++) printf("─");
     printf("%s\n", ANSI_RESET);
 
-    printf(" %s%sNEURICODE AI ASSISTANT%s %s[%s]%s %s• Model: %s • Type /help for commands%s\n",
+    printf(" %s%sNEURICODE CLI%s %s[%s]%s %s• Model: %s • Type /help for commands%s\n",
            th->primary, ANSI_BOLD, ANSI_RESET,
-           th->secondary, version ? version : "v1.0", ANSI_RESET,
+           th->primary, version ? version : "1.1.0", ANSI_RESET,
            COLOR_DARK_GRAY, model_name ? model_name : "model.bin", ANSI_RESET);
 
     printf("%s", th->muted);
     for (int i = 0; i < width; i++) printf("─");
     printf("%s\n\n", ANSI_RESET);
+}
+
+#define MAX_HIST_ENTRIES 200
+static char g_cmd_history[MAX_HIST_ENTRIES][1024];
+static int g_cmd_history_count = 0;
+
+bool tui_readline(const char *prompt_prefix, char *out_buf, size_t max_len) {
+    if (!out_buf || max_len == 0) return false;
+    out_buf[0] = '\0';
+
+    if (!isatty(STDIN_FILENO)) {
+        if (!fgets(out_buf, (int)max_len, stdin)) return false;
+        out_buf[strcspn(out_buf, "\r\n")] = '\0';
+        return true;
+    }
+
+    tui_enable_raw_mode();
+
+    char line[1024] = "";
+    int len = 0;
+    int pos = 0;
+    int hist_idx = g_cmd_history_count;
+
+    if (prompt_prefix && prompt_prefix[0] != '\0') {
+        printf("%s", prompt_prefix);
+        fflush(stdout);
+    }
+
+    while (1) {
+        char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) {
+            tui_disable_raw_mode();
+            return false;
+        }
+
+        if (c == '\r' || c == '\n') {
+            printf("\n");
+            fflush(stdout);
+            break;
+        } else if (c == 4) { // Ctrl+D
+            if (len == 0) {
+                tui_disable_raw_mode();
+                return false;
+            }
+        } else if (c == 127 || c == '\b') { // Backspace
+            if (pos > 0) {
+                memmove(&line[pos - 1], &line[pos], len - pos + 1);
+                pos--;
+                len--;
+                printf("\r%s%s\033[K", prompt_prefix ? prompt_prefix : "", line);
+                if (len - pos > 0) {
+                    printf("\033[%dD", len - pos);
+                }
+                fflush(stdout);
+            }
+        } else if (c == '\033') { // Escape sequences (Arrow keys)
+            char seq[2];
+            if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
+                if (seq[0] == '[') {
+                    if (seq[1] == 'A') { // UP Arrow
+                        if (g_cmd_history_count > 0 && hist_idx > 0) {
+                            hist_idx--;
+                            strncpy(line, g_cmd_history[hist_idx], sizeof(line) - 1);
+                            line[sizeof(line) - 1] = '\0';
+                            len = (int)strlen(line);
+                            pos = len;
+                            printf("\r%s%s\033[K", prompt_prefix ? prompt_prefix : "", line);
+                            fflush(stdout);
+                        }
+                    } else if (seq[1] == 'B') { // DOWN Arrow
+                        if (hist_idx < g_cmd_history_count) {
+                            hist_idx++;
+                            if (hist_idx == g_cmd_history_count) {
+                                line[0] = '\0';
+                            } else {
+                                strncpy(line, g_cmd_history[hist_idx], sizeof(line) - 1);
+                                line[sizeof(line) - 1] = '\0';
+                            }
+                            len = (int)strlen(line);
+                            pos = len;
+                            printf("\r%s%s\033[K", prompt_prefix ? prompt_prefix : "", line);
+                            fflush(stdout);
+                        }
+                    } else if (seq[1] == 'D') { // LEFT Arrow
+                        if (pos > 0) {
+                            pos--;
+                            printf("\033[D");
+                            fflush(stdout);
+                        }
+                    } else if (seq[1] == 'C') { // RIGHT Arrow
+                        if (pos < len) {
+                            pos++;
+                            printf("\033[C");
+                            fflush(stdout);
+                        }
+                    }
+                }
+            }
+        } else if (isprint((unsigned char)c)) {
+            if (len < (int)sizeof(line) - 1 && len < (int)max_len - 1) {
+                memmove(&line[pos + 1], &line[pos], len - pos + 1);
+                line[pos] = c;
+                pos++;
+                len++;
+                printf("\r%s%s", prompt_prefix ? prompt_prefix : "", line);
+                if (len - pos > 0) {
+                    printf("\033[%dD", len - pos);
+                }
+                fflush(stdout);
+            }
+        }
+    }
+
+    tui_disable_raw_mode();
+    strncpy(out_buf, line, max_len - 1);
+    out_buf[max_len - 1] = '\0';
+
+    if (len > 0) {
+        if (g_cmd_history_count == 0 || strcmp(g_cmd_history[g_cmd_history_count - 1], line) != 0) {
+            if (g_cmd_history_count < MAX_HIST_ENTRIES) {
+                snprintf(g_cmd_history[g_cmd_history_count], 1024, "%s", line);
+                g_cmd_history_count++;
+            } else {
+                for (int i = 0; i < MAX_HIST_ENTRIES - 1; i++) {
+                    strcpy(g_cmd_history[i], g_cmd_history[i + 1]);
+                }
+                snprintf(g_cmd_history[MAX_HIST_ENTRIES - 1], 1024, "%s", line);
+            }
+        }
+    }
+
+    return true;
 }
 
 void tui_print_antigravity_input_frame_start(void) {
