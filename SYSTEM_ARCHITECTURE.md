@@ -1,4 +1,4 @@
-# SYSTEM_ARCHITECTURE_AND_REFERENCE.md
+# SYSTEM_ARCHITECTURE.md
 ## Native Zero-Dependency Edge AI Engine in Pure C
 
 ---
@@ -7,7 +7,7 @@
 
 The `Tensor Math & Autograd Engine` provides the foundation for the entire framework, managing CPU memory structures, executing vectorized SIMD math operations, and tracking execution history dynamically using a reverse-mode autograd tape.
 
-### 1. Architectural Flow (Mermaid.js)
+### 1. Architectural Flow
 
 ```mermaid
 graph TD
@@ -83,7 +83,7 @@ The implementation resides in `src/tensor.c` and header `include/tensor.h`.
 
 The `Native Transformer Engine` represents a production-grade, decoder-only transformer block in C11. It incorporates custom alignment-aware allocations, precomputed Rotary Position Embeddings (RoPE), and highly optimized AVX2 kernels for memory prefetching, Softmax, and SwiGLU activation.
 
-### 1. Architectural Flow (Mermaid.js)
+### 1. Architectural Flow
 
 ```mermaid
 graph TD
