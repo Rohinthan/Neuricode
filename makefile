@@ -4,6 +4,7 @@ CUDA_PATH ?= /usr/local/cuda
 
 CFLAGS  = -O2 -Wall -Wextra -std=c11 -fPIC -fopenmp
 CFLAGS += -I include/
+CFLAGS += -I cuda/include/
 CFLAGS += -I config/
 CFLAGS += -I memory/
 CFLAGS += -I .
@@ -29,7 +30,7 @@ ifneq (,$(wildcard neuralc_config.h))
     CFLAGS  += -DUSE_OMP
   endif
   ifeq ($(NEURALC_USE_GPU),1)
-    CFLAGS      += -DUSE_CUDA -I include/gpu
+    CFLAGS      += -DUSE_CUDA -I cuda/include -I cuda/ -I include/gpu
     GPU_LDFLAGS += -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lstdc++
     GPU_OBJS    += build/cuda_backend.o
   endif
@@ -218,8 +219,8 @@ build/%.o: apps/%.c $(CONFIG_DEP)
 # Only built when NEURALC_GPU_BACKEND selects them (see auto-config
 # block above) — these explicit rules take precedence over the
 # generic src/%.c / src/%.cu pattern since there is none for .cu.
-build/cuda_backend.o: src/gpu/cuda_backend.cu include/gpu/cuda_backend.h
-	$(NVCC) -O3 -Xcompiler -fPIC -I include/gpu -c src/gpu/cuda_backend.cu -o build/cuda_backend.o
+build/cuda_backend.o: cuda/src/cuda_backend.cu cuda/include/cuda_backend.h
+	$(NVCC) -O3 -Xcompiler -fPIC -I cuda/include -I include/ -c cuda/src/cuda_backend.cu -o build/cuda_backend.o
 
 build/opencl_backend.o: src/gpu/opencl_backend.c include/gpu/opencl_backend.h
 	$(CC) $(CFLAGS) -c src/gpu/opencl_backend.c -o build/opencl_backend.o
@@ -242,8 +243,9 @@ omp: all
 clean:
 	rm -f build/*.o
 	rm -f neuralc demo rnn_demo mnist_demo cnn_mnist test_tensor demo_char_rnn demo_char_rnn_asan 
-	rm -f train cli sanity neurix neuricode
+	rm -f train cli sanity neurix
+	rm -f neuricode
 	rm -f benchmark_suite test_transformer
-	rm -f menuconfig libneuralc.so
+	rm -f menuconfig libneuralc.so test_transformer_bin
 	rm -f xor_weights.bin mnist_best.bin cnn_mnist_best.bin
 	@echo "Clean done"
