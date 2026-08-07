@@ -58,9 +58,9 @@ Neuricode is designed as a decoupled, modular architecture:
                                   │       (tensor.c, optimizer.c)           │
                                   └──────────┬───────────────────┬──────────┘
                                              │                   │
-                     ┌───────────────────────▼──────┐     ┌──────▼──────────────────────┐
-                     │ OpenMP Threading (CPU Acceleration) │     │ CUDA Backend (Stream/SMEM GPU)│
-                     └──────────────────────────────┘     └─────────────────────────────┘
+                  ┌──────────────────────────▼─────────┐  ┌──────▼─────────────────────────┐
+                  │ OpenMP Threading (CPU Acceleration)│  │ CUDA Backend (Stream/SMEM GPU) │
+                  └────────────────────────────────────┘  └────────────────────────────────┘
 ```
 
 ### Directory Structure
