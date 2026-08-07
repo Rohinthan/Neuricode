@@ -1,27 +1,21 @@
 /*
- * cuda_backend.cu
+ * cuda/src/cuda_backend.cu
  * ────────────────────────────────────────────────────────────────
- * CUDA kernels + launchers backing cuda_backend.h.
+ * CUDA kernels + launchers backing cuda_backend.h in cuda/ directory.
  *
- * Compiled with nvcc, linked into the rest of the (gcc-compiled)
- * project. Every op mirrors the exact math and accumulation order
- * used in tensor.c / layer.c / conv.c so that GPU and CPU results
- * match to floating-point rounding.
- *
- * Build: nvcc -O3 -c cuda_backend.cu -o cuda_backend.o \
- *            -Xcompiler -fPIC
- * Link:  -lcudart -lcublas
+ * Compiled with nvcc into build/cuda_backend.o.
  */
 
-#include "cuda_backend.h"
+#include "../include/cuda_backend.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <float.h>
 
-/* ── error handling — mirrors cforge_error() fail-fast style ─────── */
+/* ── error handling ─────────────────────────────────────────────── */
 #define CUDA_CHECK(call)                                                   \
     do {                                                                   \
         cudaError_t _err = (call);                                        \
@@ -47,15 +41,26 @@ static inline int blocks_for(size_t n) {
     return (int)((n + THREADS - 1) / THREADS);
 }
 
-/* lazily-initialized global cuBLAS handle */
+/* ── Stream & Device Global State ──────────────────────────────── */
+static cudaStream_t g_active_stream = 0;
 static cublasHandle_t g_cublas = NULL;
+static int g_tensor_cores_enabled = 1;
+
 static cublasHandle_t cublas_handle(void) {
-    if (!g_cublas) CUBLAS_CHECK(cublasCreate(&g_cublas));
+    if (!g_cublas) {
+        CUBLAS_CHECK(cublasCreate(&g_cublas));
+#if CUBLAS_VER_MAJOR >= 9
+        if (g_tensor_cores_enabled) {
+            cublasSetMathMode(g_cublas, CUBLAS_TENSOR_OP_MATH);
+        }
+#endif
+    }
+    CUBLAS_CHECK(cublasSetStream(g_cublas, g_active_stream));
     return g_cublas;
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * device / memory management
+ * Device / Stream / Multi-GPU Control
  * ════════════════════════════════════════════════════════════════ */
 
 int cuda_available(void) {
@@ -63,6 +68,55 @@ int cuda_available(void) {
     cudaError_t err = cudaGetDeviceCount(&count);
     return (err == cudaSuccess && count > 0) ? 1 : 0;
 }
+
+int cuda_get_device_count(void) {
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    return count;
+}
+
+void cuda_set_device(int device_id) {
+    CUDA_CHECK(cudaSetDevice(device_id));
+}
+
+int cuda_get_device(void) {
+    int device_id = 0;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+    return device_id;
+}
+
+void *cuda_stream_create(void) {
+    cudaStream_t stream = NULL;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    return (void *)stream;
+}
+
+void cuda_stream_destroy(void *stream) {
+    if (stream) {
+        CUDA_CHECK(cudaStreamDestroy((cudaStream_t)stream));
+    }
+}
+
+void cuda_set_stream(void *stream) {
+    g_active_stream = (cudaStream_t)stream;
+}
+
+void *cuda_get_stream(void) {
+    return (void *)g_active_stream;
+}
+
+void cuda_enable_tensor_cores(int enable) {
+    g_tensor_cores_enabled = enable;
+    if (g_cublas) {
+#if CUBLAS_VER_MAJOR >= 9
+        cublasSetMathMode(g_cublas, enable ? CUBLAS_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+#endif
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Memory Allocation & Transfers (Pinned Host & Async Device)
+ * ════════════════════════════════════════════════════════════════ */
 
 float *cuda_malloc_f32(size_t n) {
     float *ptr = NULL;
@@ -74,35 +128,59 @@ void cuda_free_f32(float *dev_ptr) {
     if (dev_ptr) CUDA_CHECK(cudaFree(dev_ptr));
 }
 
+float *cuda_malloc_host(size_t n) {
+    float *ptr = NULL;
+    CUDA_CHECK(cudaMallocHost((void **)&ptr, n * sizeof(float)));
+    return ptr;
+}
+
+void cuda_free_host(float *host_ptr) {
+    if (host_ptr) CUDA_CHECK(cudaFreeHost(host_ptr));
+}
+
+void cuda_memcpy_h2d_async(float *dst_dev, const float *src_host, size_t n, void *stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst_dev, src_host, n * sizeof(float),
+                               cudaMemcpyHostToDevice, (cudaStream_t)stream));
+}
+
+void cuda_memcpy_d2h_async(float *dst_host, const float *src_dev, size_t n, void *stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst_host, src_dev, n * sizeof(float),
+                               cudaMemcpyDeviceToHost, (cudaStream_t)stream));
+}
+
+void cuda_memcpy_d2d_async(float *dst_dev, const float *src_dev, size_t n, void *stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst_dev, src_dev, n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+}
+
 void cuda_memcpy_h2d(float *dst_dev, const float *src_host, size_t n) {
-    CUDA_CHECK(cudaMemcpy(dst_dev, src_host, n * sizeof(float),
-                           cudaMemcpyHostToDevice));
+    cuda_memcpy_h2d_async(dst_dev, src_host, n, (void *)g_active_stream);
 }
 
 void cuda_memcpy_d2h(float *dst_host, const float *src_dev, size_t n) {
-    CUDA_CHECK(cudaMemcpy(dst_host, src_dev, n * sizeof(float),
-                           cudaMemcpyDeviceToHost));
+    cuda_memcpy_d2h_async(dst_host, src_dev, n, (void *)g_active_stream);
 }
 
 void cuda_memcpy_d2d(float *dst_dev, const float *src_dev, size_t n) {
-    CUDA_CHECK(cudaMemcpy(dst_dev, src_dev, n * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    cuda_memcpy_d2d_async(dst_dev, src_dev, n, (void *)g_active_stream);
 }
 
 void cuda_memset_zero(float *dev_ptr, size_t n) {
-    CUDA_CHECK(cudaMemset(dev_ptr, 0, n * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(dev_ptr, 0, n * sizeof(float), g_active_stream));
 }
 
-void cuda_sync(void) { CUDA_CHECK(cudaDeviceSynchronize()); }
+void cuda_sync(void) {
+    if (g_active_stream) {
+        CUDA_CHECK(cudaStreamSynchronize(g_active_stream));
+    } else {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+}
 
 /* ══════════════════════════════════════════════════════════════════
- * linear algebra
+ * Linear Algebra & Optimized Transpose
  * ════════════════════════════════════════════════════════════════ */
 
-/* Row-major C[M,N] = A[M,K] @ B[K,N] via cuBLAS (which is column-major).
- * Trick: column-major C^T(N,M) = B^T(N,K) * A^T(K,M) has the SAME
- * memory layout as row-major C(M,N), so we ask cuBLAS to compute
- * that instead, with no explicit transposition needed. */
 void cuda_matmul(const float *a, const float *b, float *out,
                   int M, int K, int N) {
     const float alpha = 1.0f, beta = 0.0f;
@@ -116,25 +194,47 @@ void cuda_matmul(const float *a, const float *b, float *out,
                               out, N));
 }
 
-__global__ void k_transpose(const float *a, float *out, int rows, int cols) {
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r < rows && c < cols)
-        out[c * rows + r] = a[r * cols + c];
+/* Shared Memory Tiled Transpose (32x32 Tile with Padded Dimension for Zero Bank Conflicts) */
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+
+__global__ void k_transpose_tiled(const float * __restrict__ in,
+                                  float * __restrict__ out,
+                                  int rows, int cols) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < cols && (y + j) < rows) {
+            tile[threadIdx.y + j][threadIdx.x] = in[(y + j) * cols + x];
+        }
+    }
+
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < rows && (y + j) < cols) {
+            out[(y + j) * rows + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
 }
 
 void cuda_transpose(const float *a, float *out, int rows, int cols) {
-    dim3 block(16, 16);
-    dim3 grid((cols + 15) / 16, (rows + 15) / 16);
-    k_transpose<<<grid, block>>>(a, out, rows, cols);
+    dim3 block(TILE_DIM, BLOCK_ROWS);
+    dim3 grid((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
+    k_transpose_tiled<<<grid, block, 0, g_active_stream>>>(a, out, rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * dense (fully-connected) layer
+ * Dense (Fully-Connected) Layer & Fused Forward Pass
  * ════════════════════════════════════════════════════════════════ */
 
-/* one thread per output element z[b,o] */
 __global__ void k_linear_forward(const float *x, const float *W,
                                   const float *bias, float *z,
                                   int batch, int in_f, int out_f) {
@@ -154,12 +254,45 @@ __global__ void k_linear_forward(const float *x, const float *W,
 void cuda_linear_forward(const float *x, const float *W, const float *bias,
                           float *z, int batch, int in_f, int out_f) {
     size_t n = (size_t)batch * out_f;
-    k_linear_forward<<<blocks_for(n), THREADS>>>(x, W, bias, z,
-                                                  batch, in_f, out_f);
+    k_linear_forward<<<blocks_for(n), THREADS, 0, g_active_stream>>>(
+        x, W, bias, z, batch, in_f, out_f);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* dW[o,i] = sum_b dz[b,o]*x[b,i]  — one thread per (o,i) output cell */
+__global__ void k_fused_linear_relu(const float *x, const float *W,
+                                     const float *bias, float *out,
+                                     int batch, int in_f, int out_f) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out_f) return;
+    int b = idx / out_f;
+    int o = idx % out_f;
+
+    float acc = bias[o];
+    const float *xr = x + (size_t)b * in_f;
+    const float *wr = W + (size_t)o * in_f;
+
+    int i = 0;
+    for (; i <= in_f - 4; i += 4) {
+        acc += xr[i]     * wr[i];
+        acc += xr[i + 1] * wr[i + 1];
+        acc += xr[i + 2] * wr[i + 2];
+        acc += xr[i + 3] * wr[i + 3];
+    }
+    for (; i < in_f; i++) {
+        acc += xr[i] * wr[i];
+    }
+
+    out[idx] = acc > 0.0f ? acc : 0.0f;
+}
+
+void cuda_fused_linear_relu(const float *x, const float *W, const float *bias,
+                             float *out, int batch, int in_f, int out_f) {
+    size_t n = (size_t)batch * out_f;
+    k_fused_linear_relu<<<blocks_for(n), THREADS, 0, g_active_stream>>>(
+        x, W, bias, out, batch, in_f, out_f);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void k_linear_dW(const float *x, const float *dz, float *dW,
                              int batch, int in_f, int out_f) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -173,7 +306,6 @@ __global__ void k_linear_dW(const float *x, const float *dz, float *dW,
     dW[idx] = acc / (float)batch;
 }
 
-/* db[o] = mean_b dz[b,o] — one thread per output feature */
 __global__ void k_linear_db(const float *dz, float *db, int batch, int out_f) {
     int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= out_f) return;
@@ -183,7 +315,6 @@ __global__ void k_linear_db(const float *dz, float *db, int batch, int out_f) {
     db[o] = acc / (float)batch;
 }
 
-/* dX[b,i] = sum_o dz[b,o]*W[o,i] — one thread per (b,i) output cell */
 __global__ void k_linear_dX(const float *W, const float *dz, float *dX,
                              int batch, int in_f, int out_f) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -200,20 +331,21 @@ __global__ void k_linear_dX(const float *W, const float *dz, float *dX,
 void cuda_linear_backward(const float *x, const float *W, const float *dz,
                            float *dW, float *db, float *dX,
                            int batch, int in_f, int out_f) {
-    k_linear_dW<<<blocks_for((size_t)out_f * in_f), THREADS>>>(
+    k_linear_dW<<<blocks_for((size_t)out_f * in_f), THREADS, 0, g_active_stream>>>(
         x, dz, dW, batch, in_f, out_f);
     CUDA_CHECK(cudaGetLastError());
 
-    k_linear_db<<<blocks_for(out_f), THREADS>>>(dz, db, batch, out_f);
+    k_linear_db<<<blocks_for(out_f), THREADS, 0, g_active_stream>>>(
+        dz, db, batch, out_f);
     CUDA_CHECK(cudaGetLastError());
 
-    k_linear_dX<<<blocks_for((size_t)batch * in_f), THREADS>>>(
+    k_linear_dX<<<blocks_for((size_t)batch * in_f), THREADS, 0, g_active_stream>>>(
         W, dz, dX, batch, in_f, out_f);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * elementwise ops
+ * Elementwise Operations & Fused Kernels
  * ════════════════════════════════════════════════════════════════ */
 
 #define ELEMWISE_BINARY(NAME, OP)                                          \
@@ -223,7 +355,7 @@ void cuda_linear_backward(const float *x, const float *W, const float *dz,
         if (i < n) out[i] = (OP);                                          \
     }                                                                      \
     void cuda_##NAME(const float *a, const float *b, float *out, size_t n) { \
-        k_##NAME<<<blocks_for(n), THREADS>>>(a, b, out, n);                \
+        k_##NAME<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, b, out, n); \
         CUDA_CHECK(cudaGetLastError());                                    \
     }
 
@@ -231,12 +363,56 @@ ELEMWISE_BINARY(add, a[i] + b[i])
 ELEMWISE_BINARY(sub, a[i] - b[i])
 ELEMWISE_BINARY(mul, a[i] * b[i])
 
+__global__ void k_fused_add_relu(const float *a, const float *b, float *out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float sum = a[i] + b[i];
+        out[i] = sum > 0.0f ? sum : 0.0f;
+    }
+}
+
+void cuda_fused_add_relu(const float *a, const float *b, float *out, size_t n) {
+    k_fused_add_relu<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, b, out, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_fused_mul_relu(const float *a, const float *b, float *out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float prod = a[i] * b[i];
+        out[i] = prod > 0.0f ? prod : 0.0f;
+    }
+}
+
+void cuda_fused_mul_relu(const float *a, const float *b, float *out, size_t n) {
+    k_fused_mul_relu<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, b, out, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_fused_add_bias_relu(const float *a, const float *bias, float *out,
+                                      int batch, int cols) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)batch * cols;
+    if (idx >= total) return;
+    int c = idx % cols;
+    float val = a[idx] + bias[c];
+    out[idx] = val > 0.0f ? val : 0.0f;
+}
+
+void cuda_fused_add_bias_relu(const float *a, const float *bias, float *out,
+                              int batch, int cols) {
+    size_t total = (size_t)batch * cols;
+    k_fused_add_bias_relu<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
+        a, bias, out, batch, cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void k_scale(const float *a, float s, float *out, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] * s;
 }
 void cuda_scale(const float *a, float s, float *out, size_t n) {
-    k_scale<<<blocks_for(n), THREADS>>>(a, s, out, n);
+    k_scale<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, s, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -245,7 +421,7 @@ __global__ void k_add_scalar(const float *a, float s, float *out, size_t n) {
     if (i < n) out[i] = a[i] + s;
 }
 void cuda_add_scalar(const float *a, float s, float *out, size_t n) {
-    k_add_scalar<<<blocks_for(n), THREADS>>>(a, s, out, n);
+    k_add_scalar<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, s, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -254,12 +430,12 @@ __global__ void k_fill(float *a, float val, size_t n) {
     if (i < n) a[i] = val;
 }
 void cuda_fill(float *a, float val, size_t n) {
-    k_fill<<<blocks_for(n), THREADS>>>(a, val, n);
+    k_fill<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, val, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * activations
+ * Activations
  * ════════════════════════════════════════════════════════════════ */
 
 __global__ void k_relu(const float *a, float *out, size_t n) {
@@ -267,7 +443,7 @@ __global__ void k_relu(const float *a, float *out, size_t n) {
     if (i < n) out[i] = a[i] > 0.0f ? a[i] : 0.0f;
 }
 void cuda_relu(const float *a, float *out, size_t n) {
-    k_relu<<<blocks_for(n), THREADS>>>(a, out, n);
+    k_relu<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -276,7 +452,7 @@ __global__ void k_relu_grad(const float *a, const float *grad, float *out, size_
     if (i < n) out[i] = a[i] > 0.0f ? grad[i] : 0.0f;
 }
 void cuda_relu_grad(const float *a, const float *grad, float *out, size_t n) {
-    k_relu_grad<<<blocks_for(n), THREADS>>>(a, grad, out, n);
+    k_relu_grad<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, grad, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -285,7 +461,7 @@ __global__ void k_sigmoid(const float *a, float *out, size_t n) {
     if (i < n) out[i] = 1.0f / (1.0f + expf(-a[i]));
 }
 void cuda_sigmoid(const float *a, float *out, size_t n) {
-    k_sigmoid<<<blocks_for(n), THREADS>>>(a, out, n);
+    k_sigmoid<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -294,7 +470,7 @@ __global__ void k_sigmoid_grad(const float *sig, const float *grad, float *out, 
     if (i < n) out[i] = grad[i] * sig[i] * (1.0f - sig[i]);
 }
 void cuda_sigmoid_grad(const float *sig, const float *grad, float *out, size_t n) {
-    k_sigmoid_grad<<<blocks_for(n), THREADS>>>(sig, grad, out, n);
+    k_sigmoid_grad<<<blocks_for(n), THREADS, 0, g_active_stream>>>(sig, grad, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -303,7 +479,7 @@ __global__ void k_tanh(const float *a, float *out, size_t n) {
     if (i < n) out[i] = tanhf(a[i]);
 }
 void cuda_tanh_f(const float *a, float *out, size_t n) {
-    k_tanh<<<blocks_for(n), THREADS>>>(a, out, n);
+    k_tanh<<<blocks_for(n), THREADS, 0, g_active_stream>>>(a, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -312,11 +488,10 @@ __global__ void k_tanh_grad(const float *th, const float *grad, float *out, size
     if (i < n) out[i] = grad[i] * (1.0f - th[i] * th[i]);
 }
 void cuda_tanh_grad(const float *th, const float *grad, float *out, size_t n) {
-    k_tanh_grad<<<blocks_for(n), THREADS>>>(th, grad, out, n);
+    k_tanh_grad<<<blocks_for(n), THREADS, 0, g_active_stream>>>(th, grad, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* one block per row; shared-memory max/sum reduction for stability */
 __global__ void k_softmax_rows(const float *a, float *out, int cols) {
     extern __shared__ float sh[];
     int row = blockIdx.x;
@@ -324,7 +499,6 @@ __global__ void k_softmax_rows(const float *a, float *out, int cols) {
     const float *in_row = a + (size_t)row * cols;
     float *out_row = out + (size_t)row * cols;
 
-    /* max */
     float local_max = -FLT_MAX;
     for (int j = tid; j < cols; j += blockDim.x)
         local_max = fmaxf(local_max, in_row[j]);
@@ -337,7 +511,6 @@ __global__ void k_softmax_rows(const float *a, float *out, int cols) {
     float row_max = sh[0];
     __syncthreads();
 
-    /* exp + sum */
     float local_sum = 0.0f;
     for (int j = tid; j < cols; j += blockDim.x) {
         float e = expf(in_row[j] - row_max);
@@ -360,18 +533,17 @@ __global__ void k_softmax_rows(const float *a, float *out, int cols) {
 void cuda_softmax_rows(const float *a, float *out, int rows, int cols) {
     int threads = 128;
     size_t shmem = threads * sizeof(float);
-    k_softmax_rows<<<rows, threads, shmem>>>(a, out, cols);
+    k_softmax_rows<<<rows, threads, shmem, g_active_stream>>>(a, out, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * Conv2D — direct convolution (input pre-padded by the caller)
+ * Conv2D — Direct Convolution & Padding
  * ════════════════════════════════════════════════════════════════ */
 
 #define IDX4D(b,c,h,w, C,H,W) \
     ((size_t)(b)*(C)*(H)*(W) + (size_t)(c)*(H)*(W) + (size_t)(h)*(W) + (w))
 
-/* one thread per SOURCE element input[b,c,h,w] */
 __global__ void k_pad2d(const float *input, float *output,
                          int batch, int C, int H, int W, int pad) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -393,11 +565,11 @@ void cuda_pad2d(const float *input, float *output,
     size_t pad_n = (size_t)batch * C * (H + 2 * pad) * (W + 2 * pad);
     cuda_memset_zero(output, pad_n);
     if (pad == 0) { cuda_memcpy_d2d(output, input, total); return; }
-    k_pad2d<<<blocks_for(total), THREADS>>>(input, output, batch, C, H, W, pad);
+    k_pad2d<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
+        input, output, batch, C, H, W, pad);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* one thread per OUTPUT (cropped) element */
 __global__ void k_unpad2d(const float *padded, float *output,
                            int batch, int C, int H, int W, int pad) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -417,11 +589,11 @@ void cuda_unpad2d(const float *padded, float *output,
                    int batch, int C, int H, int W, int pad) {
     size_t total = (size_t)batch * C * H * W;
     if (pad == 0) { cuda_memcpy_d2d(output, padded, total); return; }
-    k_unpad2d<<<blocks_for(total), THREADS>>>(padded, output, batch, C, H, W, pad);
+    k_unpad2d<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
+        padded, output, batch, C, H, W, pad);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* one thread per output element output[b,oc,oh,ow] */
 __global__ void k_conv2d_forward(const float *input, const float *W,
                                   const float *bias, float *output,
                                   int batch, int in_C, int pH, int pW,
@@ -454,15 +626,12 @@ void cuda_conv2d_forward(const float *input_padded, const float *W,
                           int out_C, int kH, int kW, int stride,
                           int out_H, int out_W) {
     size_t total = (size_t)batch * out_C * out_H * out_W;
-    k_conv2d_forward<<<blocks_for(total), THREADS>>>(
+    k_conv2d_forward<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
         input_padded, W, bias, output,
         batch, in_C, pH, pW, out_C, kH, kW, stride, out_H, out_W);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* one thread per upstream-gradient element grad_out[b,oc,oh,ow];
- * scatters into dW/db/dpad_grad_in with atomicAdd, exactly mirroring
- * the CPU accumulation order (unscaled — caller divides by batch). */
 __global__ void k_conv2d_backward(const float *input, const float *W,
                                    const float *grad_out,
                                    float *dW, float *db, float *dpad,
@@ -507,7 +676,7 @@ void cuda_conv2d_backward(const float *input_padded, const float *W,
     cuda_memset_zero(dpad_grad_in, pad_n);
 
     size_t total = (size_t)batch * out_C * out_H * out_W;
-    k_conv2d_backward<<<blocks_for(total), THREADS>>>(
+    k_conv2d_backward<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
         input_padded, W, grad_out, dW, db, dpad_grad_in,
         batch, in_C, pH, pW, out_C, kH, kW, stride, out_H, out_W);
     CUDA_CHECK(cudaGetLastError());
@@ -517,8 +686,6 @@ void cuda_conv2d_backward(const float *input_padded, const float *W,
  * MaxPool2D
  * ════════════════════════════════════════════════════════════════ */
 
-/* one thread per output element; mask[out_idx] = flat index into
- * the full input tensor (matches CPU maxpool2d_forward exactly) */
 __global__ void k_maxpool2d_forward(const float *input, float *output,
                                      float *mask,
                                      int batch, int C, int H, int W,
@@ -551,15 +718,11 @@ void cuda_maxpool2d_forward(const float *input, float *output, float *mask,
                              int batch, int C, int H, int W,
                              int pool_size, int stride, int out_H, int out_W) {
     size_t total = (size_t)batch * C * out_H * out_W;
-    k_maxpool2d_forward<<<blocks_for(total), THREADS>>>(
+    k_maxpool2d_forward<<<blocks_for(total), THREADS, 0, g_active_stream>>>(
         input, output, mask, batch, C, H, W, pool_size, stride, out_H, out_W);
     CUDA_CHECK(cudaGetLastError());
 }
 
-/* scatter: one thread per upstream-gradient element; mask gives the
- * exact input index to accumulate into, so atomicAdd is required
- * (multiple output cells never collide here, but we keep it generic
- * and safe regardless of pooling window overlap). */
 __global__ void k_maxpool2d_backward(const float *grad_out, float *grad_in,
                                       const float *mask, size_t n) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -577,7 +740,58 @@ void cuda_maxpool2d_backward(const float *grad_out, float *grad_in,
     size_t out_n = (size_t)batch * C * out_H * out_W;
 
     cuda_memset_zero(grad_in, in_n);
-    k_maxpool2d_backward<<<blocks_for(out_n), THREADS>>>(
+    k_maxpool2d_backward<<<blocks_for(out_n), THREADS, 0, g_active_stream>>>(
         grad_out, grad_in, mask, out_n);
     CUDA_CHECK(cudaGetLastError());
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * FP16 Half-Precision & Tensor Core Support
+ * ══════════════════════════════════════════════════════════════════ */
+
+void *cuda_malloc_f16(size_t n) {
+    __half *ptr = NULL;
+    CUDA_CHECK(cudaMalloc((void **)&ptr, n * sizeof(__half)));
+    return (void *)ptr;
+}
+
+void cuda_free_f16(void *dev_ptr) {
+    if (dev_ptr) CUDA_CHECK(cudaFree(dev_ptr));
+}
+
+__global__ void k_f32_to_f16(const float *src, __half *dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+void cuda_f32_to_f16(const float *src_f32, void *dst_f16, size_t n) {
+    k_f32_to_f16<<<blocks_for(n), THREADS, 0, g_active_stream>>>(
+        src_f32, (__half *)dst_f16, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void k_f16_to_f32(const __half *src, float *dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
+}
+
+void cuda_f16_to_f32(const void *src_f16, float *dst_f32, size_t n) {
+    k_f16_to_f32<<<blocks_for(n), THREADS, 0, g_active_stream>>>(
+        (__half *)src_f16, dst_f32, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void cuda_matmul_fp16(const void *a_f16, const void *b_f16, void *out_f16,
+                       int M, int K, int N) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemmEx(cublas_handle(),
+                                CUBLAS_OP_N, CUBLAS_OP_N,
+                                N, M, K,
+                                &alpha,
+                                b_f16, CUDA_R_16F, N,
+                                a_f16, CUDA_R_16F, K,
+                                &beta,
+                                out_f16, CUDA_R_16F, N,
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
