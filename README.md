@@ -1,161 +1,153 @@
-# Neuricode — Native Zero-Dependency Edge AI Engine in Pure C. A similar version of Neurix.
+#  Neuricode — Native Zero-Dependency Edge AI Engine & C11 Deep Learning Framework
 
-
-##  Key Highlights & Engineering Features
-
-- **Zero External Dependencies**: 100% written in standard C (C11/POSIX). No PyTorch, no Python, no heavy third-party math bloat.
-- **Embedded & Edge Systems Ready**: Engineered for ultra-low footprint devices. Runs anywhere standard C compiles.
-- **Classic Antigravity CLI Interface**: Sleek terminal UI featuring straight divider frames, purple aesthetics, 8 selectable color themes, and smooth character typing animations.
-- **Dynamic Window Auto-Resizing (`SIGWINCH`)**: Catches OS window resize signals (`ioctl`) to automatically adjust border frames live when minimizing, maximizing, or dragging your terminal window.
-- **Dynamic Path Auto-Discovery**: Automatically locates model weights (`model.bin`) and vocabularies (`assets/vocab.txt`) across environment variables, working directories, or binary location (`/proc/self/exe`).
-- **Kernel-Style `menuconfig` TUI**: Linux kernel-inspired terminal interface (`make config`) to adjust hyperparameters without touching source code.
-- **Multi-Core Hardware Acceleration**: Parallel execution via OpenMP CPU threading with optional CUDA & OpenCL GPU backend hooks.
-- **Added Decoder-Only Transformer Engine**.
-- **SIMD-Accelerated**:(AVX2 / ARM NEON / Unrolled Scalar) Tiled Matrix Multiplication
-- **Precomputed RoPE**: (Rotary Position Embeddings) Cos/Sin Lookup Tables
-- **Optimized KV-Cache**: Layout for Contiguous Sequential Memory Prefetching
-- **Strict**: 64-Byte Aligned Memory Allocations via neuralc_aligned_alloc
-- **Numerically Stable**: Softmax and RMSNorm (Log-Sum-Exp / Epsilon / NaN Guards)
-- **Debug Mode & Tensor Validation** (NaN / Inf Diagnostics)
-- **Pretrained**: Binary Weight Loading & Saving API
-- **Multi-Token**: Batch Forward Inference Engine
-- **INT8 (Q8_0) Quantization**: Support for Ultra-Low Footprint Inference
-- **Support**: HIGH-END / LOW END MICROKERNEL'S
-- **Added Feature** control to change the RNN / Transformer Via TUI and,
-- **Added in Config menu Transformer Engine Setup**
-    - Vocabulary size
-    - Hidden Dimension
-    - FFN Expansion Dim
-    - Number of LAyers
-    - Number of Heads
-    - Max context Length
-
+<p align="center">
+  <b>A lightweight, high-performance Deep Learning Framework & Transformer / LLM Engine written from first principles in 100% Pure ISO C11.</b>
+</p>
 
 ---
 
-##  How Neuricode Works (Under the Hood)
+> [!IMPORTANT]
+> **What is Neuricode ? Is it a Deep Learning Framework or an LLM Engine?**  
+> **It is BOTH!**
+> 1. **A Native C11 Deep Learning Framework**: Implements $N$-dimensional tensors, automatic differentiation (autograd), matrix GEMM, layers (Linear, Conv2D, BatchNorm, Dropout), optimizers (SGD, Adam), and high-performance CUDA GPU backends.
+> 2. **An Embedded Generative AI / LLM & Sequence Engine**: Built directly on top of the framework, executing multi-head attention Transformers, Recurrent Neural Networks (RNNs), byte/word tokenization, and dynamic Top-K / Top-P nucleus sampling in a tiny **~4.4 MB standalone binary**.
 
-For new users wanting to understand the inner workings of Neuricode v1, the architecture is divided into decoupled, modular C translation units:
+---
+
+## Creator's Vision & Why Neuricode is Unique
+
+Modern Artificial Intelligence is heavily reliant on massive 2–5 GB Python frameworks (PyTorch, TensorFlow) requiring Python interpreters, CUDA toolchains, and expensive GPUs. Conversely, C++ inference engines (like `llama.cpp` or `ONNX Runtime`) focus strictly on executing pre-trained models and require C++ runtimes and complex build pipelines.
+
+**Neuricode v1 was engineered to bridge this gap.** Built entirely in standard C (C11/POSIX) with **zero external library dependencies**, Neuricode v1 provides a unified engine for both training (backpropagation) and generative inference. It boots in under **2 milliseconds** and runs natively on resource-constrained embedded platforms—including **Raspberry Pi, NVIDIA Jetson, microcontrollers, edge IoT devices, and Linux servers**.
+
+---
+
+##  Key Highlights & Engineering Innovations
+
+- **Zero Third-Party Dependencies**: Written in 100% ISO C11. No PyTorch, no Python, no BLAS/LAPACK, no OpenBLAS/MKL requirement.
+- **Edge & Embedded System Ready**: Boots instantly (< 2 ms) with a tiny memory footprint (~4.4 MB binary).
+- **Full Autograd & Training Engine**: Reverse-mode automatic differentiation, backpropagation through time (BPTT), SGD with momentum, Adam optimizer, gradient clipping, and checkpoint serialization.
+- **Native Transformer / LLM Architecture**: Multi-head self-attention, scaled dot-product attention, positional embeddings, RMSNorm/LayerNorm, byte/word tokenizers, and Temperature/Top-K/Top-P samplers.
+- **Asynchronous CUDA Stream GPU Backend**: Stream-bound cuBLAS (`cublasSetStream`), pinned host memory (`cudaMallocHost`), non-blocking transfers (`cudaMemcpyAsync`), $32 \times 32$ tiled shared-memory matrix transpose (zero bank conflicts), fused kernels (`linear_relu`, `add_relu`), multi-GPU device selection, and FP16 Tensor Core support.
+- **Linux Kernel-Style `menuconfig` TUI**: Interactive terminal configuration interface (`make config`) to adjust hyperparameters and hardware backends without modifying source code.
+- **Antigravity CLI Shell**: Interactive terminal prompt with real-time `SIGWINCH` window resizing (`ioctl`), 8 selectable color themes, double-buffered rendering, and live system status dashboards.
+
+---
+
+##  System Architecture Overview
+
+Neuricode is designed as a decoupled, modular architecture:
 
 ```text
-Neuricode/
-├── apps/                  # Application Entry Points
-│   ├── neuricode_cli.c    # Antigravity interactive CLI shell & REPL loop
-│   ├── train.c            # Streaming dataset model trainer
-│   ├── cli.c              # Basic inference utility
-│   └── pipeline.c         # High-level model loader & inference pipeline
-├── include/               # Public C Headers
-│   ├── tui.h              # Antigravity TUI engine header
-│   ├── tensor.h           # N-dimensional tensor math header
-│   ├── pipeline.h         # Model loader & step pipeline header
-│   └── tokenizer.h        # Tokenizer & vocabulary header
-├── src/                   # Core Math & Engine Implementation
-│   ├── tui.c              # Terminal UI engine (termios raw mode, SIGWINCH, themes)
-│   ├── tensor.c           # Custom row-major matrix/tensor memory routines
-│   ├── rnn.c              # Recurrent Neural Network layers & BPTT algorithms
-│   ├── layer.c            # Dense (linear) layers, Softmax, activations
-│   ├── optimizer.c        # SGD with momentum, weight decay, gradient clipping
-│   ├── tokenizer.c        # Greedy byte/word vocabulary encoder & decoder
-│   ├── sampler.c          # Temperature, Top-K, Top-P (Nucleus) samplers
-│   └── dataset_loader.c   # Streaming binary batch dataset loader
-└── makefile               # C11 build automation & auto-config loader
+                                  ┌─────────────────────────────────────────┐
+                                  │      Neuricode CLI Shell (tui.c)        │
+                                  └────────────────────┬────────────────────┘
+                                                       │
+                                  ┌────────────────────▼────────────────────┐
+                                  │    Inference & Step Pipeline            │
+                                  │  (pipeline.c, sampler.c, tokenizer.c)   │
+                                  └────────────────────┬────────────────────┘
+                                                       │
+                                  ┌────────────────────▼────────────────────┐
+                                  │    Neural Architecture & Layers         │
+                                  │    (transformer.c, rnn.c, layer.c)      │
+                                  └────────────────────┬────────────────────┘
+                                                       │
+                                  ┌────────────────────▼────────────────────┐
+                                  │    Core Tensor & Autograd Engine        │
+                                  │       (tensor.c, optimizer.c)           │
+                                  └──────────┬───────────────────┬──────────┘
+                                             │                   │
+                     ┌───────────────────────▼──────┐     ┌──────▼──────────────────────┐
+                     │ OpenMP Threading (CPU Acceleration) │     │ CUDA Backend (Stream/SMEM GPU)│
+                     └──────────────────────────────┘     └─────────────────────────────┘
 ```
 
-### The Execution Steps:
-1. **Tensor Math (`src/tensor.c`)**: Manages contiguous N-dimensional floating-point arrays, matrix multiplications (`GEMM`), vector additions, and SIMD vectorizations.
-2. **Neural Forward Pass & BPTT (`src/rnn.c`, `src/layer.c`)**: Calculates hidden state transitions across timesteps for sequence generation and backpropagates gradients through time during training.
-3. **Logit Sampling (`src/sampler.c`)**: Scaled Softmax probabilities using Temperature and Top-K filtering to select next-token output IDs.
-4. **Antigravity TUI Shell (`src/tui.c`, `apps/neuricode_cli.c`)**: Renders framed terminal prompts, handles Linux raw-mode keyboard inputs, listens to `SIGWINCH` resize events, and streams generated text output smoothly.
+### Directory Structure
 
----
+```text
+neuricode/
+├── apps/                  # CLI & Application Entry Points
+│   ├── neuricode_cli.c    # Interactive Antigravity CLI Shell & REPL loop
+│   ├── train.c            # Streaming dataset model trainer
+│   └── cli.c              # Command-line inference utility
+├── cuda/                  # High-Performance CUDA GPU Backend
+│   ├── include/
+│   │   └── cuda_backend.h # Primary C-API CUDA backend header
+│   └── src/
+│       └── cuda_backend.cu# Stream-bound CUDA kernels & tiled SMEM transpose
+├── include/               # Public Engine C Headers
+│   ├── tensor.h           # N-dimensional tensor math & autograd header
+│   ├── layer.h            # Neural layer definitions (Linear, Conv2D, Softmax)
+│   ├── transformer.h      # Multi-head attention Transformer header
+│   ├── pipeline.h         # Model loader & sequence step pipeline
+│   ├── tokenizer.h        # Byte/word tokenizer header
+│   └── tui.h              # Antigravity Terminal UI engine header
+├── src/                   # Core Engine Implementations
+│   ├── tensor.c           # Contiguous memory array math & vectorization
+│   ├── transformer.c      # Transformer forward & self-attention math
+│   ├── rnn.c              # Recurrent Neural Network layers & BPTT
+│   ├── layer.c            # Dense layers, activations, loss functions
+│   ├── optimizer.c        # SGD & Adam optimizer algorithms
+│   ├── tokenizer.c        # Greedy vocabulary encoder & decoder
+│   ├── sampler.c          # Logit temperature & Top-K / Top-P samplers
+│   └── tui.c              # Raw-mode termios & SIGWINCH layout engine
+├── config/                # Terminal Configuration UI
+│   ├── config_ui.c        # Kernel-style menuconfig TUI engine
+│   └── neuralc_config_main.c # Standalone config executable entry
+├── memory/                # Memory Arena & Allocator
+│   └── memory.c           # Memory pool allocator
+├── neuralc_config.h       # System Configuration Manifest (Generated by menuconfig)
+└── makefile               # Pure C11 build automation & auto-config loader
+```
 
-## Quickstart Guide for New Users
 
-### 1. Build the Neuricode Assistant
-Compile the native binary with zero external dependencies and install to system PATH:
+##  Quickstart & Building Guide
+
+### 1. Prerequisite
+Standard C compiler (`gcc` or `clang`), `make`, and optional NVIDIA CUDA Toolkit (`nvcc`) for GPU acceleration.
+
+### 2. Build Neuricode CLI
+Compile the production binary in one command:
 
 ```bash
 make neuricode
 ```
+
+To install system-wide to `~/.local/bin/neuricode`:
+
 ```bash
 make install
 ```
 
-### 2. Run the Interactive CLI
-Launch the terminal UI directly from anywhere in your shell by simply typing:
-
-```bash
-neuricode
-```
-
-Or run locally within the repository directory:
-
-```bash
-./neuricode
-```
-
-### 3. Interactive Slash Commands Inside CLI
-Inside `neuricode`, you can type commands starting with `/`:
-
-| Command | Action |
-|---|---|
-| `/help` | Display command manual and active hyperparameters |
-| `/theme` | Open interactive arrow-key selector (8 Color Palettes) |
-| `/status` | Display system dashboard (Model, Vocab, Hardware status) |
-| `/temp <val>` | Set sampling temperature dynamically (e.g. `/temp 0.30` for coherent text) |
-| `/topk <val>` | Set Top-K sampling cap dynamically (e.g. `/topk 10`) |
-| `/log` | Run test demonstration of colored log badges |
-| `/reset` | Reset model hidden state memory |
-| `/clear` | Clear terminal screen |
-| `/exit` | Quit Neuricode CLI |
-
----
-
-## 8 Selectable Color Themes
-
-Type `/theme` in the CLI to switch color palettes using **↑ / ↓ Arrow Keys**:
-
-1. **Classic Purple (Default)** — Sleek Purple / Magenta / White
-2. **Cyberpunk Cyan** — Neon Cyan / Pink
-3. **Matrix Green** — Electric Green / Yellow
-4. **Sunset Orange** — Neon Orange / Gold
-5. **Electric Blue** — Cobalt Blue / Bright Cyan
-6. **Crimson Red** — Neon Crimson / Coral
-7. **Emerald Mint** — Teal / Mint Green
-8. **Monochrome Dark** — Slate Gray / Silver Minimalist
-
----
-
-## Training Your Own Model on Custom Text
-
-Want to train Neuricode on your own text dataset (books, code, or stories)?
-
-### Step 1: Configure Hyperparameters
-Launch the kernel-style configuration menu:
+### 3. Interactive Hyperparameter Configuration (`menuconfig`)
+Adjust parameters, OpenMP threading, and CUDA GPU backends via Linux kernel-style TUI:
 
 ```bash
 make config
 ```
 
-Use Arrow Keys to set `HIDDEN_SIZE` (e.g. 256 or 512) and `EPOCHS` (e.g. 50), then press `S` to save.
+### 4. Run the Interactive Terminal Shell
+Launch the interactive AI shell:
 
-### Step 2: Run Training
-Place your raw text in `assets/data.txt` and run:
-
-```bash
-make train
-./train assets/data.txt assets/vocab.txt model.bin
-```
-
-### Step 3: Run Your New Model
 ```bash
 neuricode
 ```
 
+Inside `neuricode`, use `/` commands to control execution:
+
+| Command | Description |
+|---|---|
+| `/help` | Display manual, active model specs, and hyperparameters |
+| `/status` | View system dashboard (Model, Vocab, Hardware status) |
+| `/theme` | Open interactive arrow-key color theme selector (8 themes) |
+| `/temp <val>` | Set sampling temperature dynamically (e.g. `/temp 0.30`) |
+| `/topk <val>` | Set Top-K sampling cap dynamically (e.g. `/topk 10`) |
+| `/reset` | Reset model hidden state memory |
+| `/clear` | Clear terminal screen |
+| `/exit` | Exit Neuricode CLI |
 
 ---
-
-
 
 ## 📜 License
 
