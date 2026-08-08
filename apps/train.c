@@ -109,6 +109,7 @@ typedef struct {
     int auto_mode;
     int override_vocab;
     int custom_vocab_size;
+    char resume_path[1024];
 } TrainConfig;
 
 TrainConfig default_config(void) {
@@ -121,7 +122,8 @@ TrainConfig default_config(void) {
         .temperature = TEMPERATURE,
         .auto_mode = 0,
         .override_vocab = 0,
-        .custom_vocab_size = 0
+        .custom_vocab_size = 0,
+        .resume_path = ""
     };
     return config;
 }
@@ -168,6 +170,27 @@ static int save_model(const char *path, const RNNLayer *rnn,
 
     if (fclose(f) != 0) ok = 0;
     return ok ? 0 : -1;
+}
+
+static void save_checkpoint(const RNNLayer *rnn, const DenseLayer *out_layer,
+                            int vocab_size, int hidden_size, int epoch) {
+    char ckpt_path[1024];
+    snprintf(ckpt_path, sizeof(ckpt_path), "checkpoint_epoch_%d.bin", epoch);
+    if (save_model(ckpt_path, rnn, out_layer, vocab_size, hidden_size) == 0) {
+        printf("[checkpoint] Saved epoch snapshot -> '%s'\n", ckpt_path);
+    } else {
+        fprintf(stderr, "[checkpoint] Error: failed to save epoch checkpoint '%s'\n", ckpt_path);
+    }
+}
+
+static void save_best_checkpoint(const RNNLayer *rnn, const DenseLayer *out_layer,
+                                 int vocab_size, int hidden_size, float loss) {
+    const char *best_path = "checkpoint_best.bin";
+    if (save_model(best_path, rnn, out_layer, vocab_size, hidden_size) == 0) {
+        printf("[checkpoint] New best model saved (loss: %.4f) -> '%s'\n", loss, best_path);
+    } else {
+        fprintf(stderr, "[checkpoint] Error: failed to save best checkpoint '%s'\n", best_path);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -358,7 +381,7 @@ static void fill_onehot_2d(Tensor *dst, const uint32_t *ids,
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-                "Usage: %s <data.txt> <vocab.txt> <model.bin> [epochs] [seq_len] [batch_size] [learning_rate] [auto_mode] [custom_vocab_size]\n",
+                "Usage: %s <data.txt> <vocab.txt> <model.bin> [epochs] [seq_len] [batch_size] [learning_rate] [auto_mode] [custom_vocab_size] [--resume <checkpoint.bin>]\n",
                 argv[0]);
         return 1;
     }
@@ -366,25 +389,37 @@ int main(int argc, char **argv) {
     const char *vocab_path = argv[2];
     const char *model_path = argv[3];
     TrainConfig config = default_config();
-    if (argc > 4) config.epochs = atoi(argv[4]);
-    if (argc > 5) config.seq_len = atoi(argv[5]);
-    if (argc > 6) config.batch_size = atoi(argv[6]);
-    if (argc > 7) config.learning_rate = strtof(argv[7], NULL);
-    if (argc > 8) config.auto_mode = (atoi(argv[8]) == 1);
-    if (argc > 9) {
+
+    /* Parse positional arguments */
+    if (argc > 4 && strncmp(argv[4], "--", 2) != 0) config.epochs = atoi(argv[4]);
+    if (argc > 5 && strncmp(argv[5], "--", 2) != 0) config.seq_len = atoi(argv[5]);
+    if (argc > 6 && strncmp(argv[6], "--", 2) != 0) config.batch_size = atoi(argv[6]);
+    if (argc > 7 && strncmp(argv[7], "--", 2) != 0) config.learning_rate = strtof(argv[7], NULL);
+    if (argc > 8 && strncmp(argv[8], "--", 2) != 0) config.auto_mode = (atoi(argv[8]) == 1);
+    if (argc > 9 && strncmp(argv[9], "--", 2) != 0) {
         config.custom_vocab_size = atoi(argv[9]);
         if (config.custom_vocab_size > 0) config.override_vocab = 1;
     }
+
+    /* Parse --resume flag across all CLI arguments */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
+            snprintf(config.resume_path, sizeof(config.resume_path), "%s", argv[i + 1]);
+        } else if (strncmp(argv[i], "--resume=", 9) == 0) {
+            snprintf(config.resume_path, sizeof(config.resume_path), "%s", argv[i] + 9);
+        }
+    }
+
     if (config.epochs <= 0) config.epochs = default_config().epochs;
     if (config.seq_len <= 0) config.seq_len = default_config().seq_len;
     if (config.batch_size <= 0) config.batch_size = default_config().batch_size;
     if (config.learning_rate <= 0.0f)
         config.learning_rate = default_config().learning_rate;
 
-    printf("[config] epochs=%d seq_len=%d batch=%d lr=%f hidden=%d auto=%d vocab_override=%d\n",
+    printf("[config] epochs=%d seq_len=%d batch=%d lr=%f hidden=%d auto=%d vocab_override=%d resume='%s'\n",
            config.epochs, config.seq_len, config.batch_size,
            config.learning_rate, config.hidden_size, config.auto_mode,
-           config.override_vocab);
+           config.override_vocab, config.resume_path[0] ? config.resume_path : "none");
 
     printf("[train] Loading tokenizer from '%s'...\n", vocab_path);
     Tokenizer *tok = tokenizer_load(vocab_path);
@@ -426,30 +461,45 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-
     RNNLayer *rnn = NULL;
     DenseLayer *dense = NULL;
 
-    if (access(model_path, F_OK) == 0) {
-        printf("[train] Loading existing model from '%s' ...\n", model_path);
+    const char *init_model_src = NULL;
+    if (config.resume_path[0] != '\0') {
+        if (access(config.resume_path, F_OK) != 0) {
+            fprintf(stderr, "[train] Error: Specified resume checkpoint '%s' does not exist\n", config.resume_path);
+            dataset_close(ds);
+            tokenizer_free(tok);
+            return 1;
+        }
+        init_model_src = config.resume_path;
+        printf("[train] Resuming training from checkpoint '%s'...\n", init_model_src);
+    } else if (access(model_path, F_OK) == 0) {
+        init_model_src = model_path;
+        printf("[train] Loading existing model weights from '%s'...\n", init_model_src);
+    }
 
-        FILE *f = fopen(model_path, "rb");
+    if (init_model_src) {
+        FILE *f = fopen(init_model_src, "rb");
         if (!f) {
-            fprintf(stderr, "[train] Failed to open model file \n");
+            fprintf(stderr, "[train] Error opening model file '%s'\n", init_model_src);
+            dataset_close(ds);
+            tokenizer_free(tok);
             return 1;
         }
 
         int32_t vs = 0, hs = 0;
         if (fread(&vs, sizeof(int32_t), 1, f) != 1 ||
             fread(&hs, sizeof(int32_t), 1, f) != 1) {
-            fprintf(stderr, "[train] Error reading model header\n");
+            fprintf(stderr, "[train] Error reading model header from '%s'\n", init_model_src);
             fclose(f);
+            dataset_close(ds);
+            tokenizer_free(tok);
             return 1;
         }
 
         if (vs != vocab_size) {
             printf("[train] Warning: vocab mismatch (%d vs %d)\n", vs, vocab_size);
-
         }
 
         rnn = rnn_create(vocab_size, hs);
@@ -461,39 +511,15 @@ int main(int argc, char **argv) {
         size_t n4 = fread(dense->W->data,  sizeof(float), dense->W->size,  f);
         size_t n5 = fread(dense->b->data,  sizeof(float), dense->b->size,  f);
         (void)n1; (void)n2; (void)n3; (void)n4; (void)n5;
-    
         fclose(f);
 
-        printf("[train] MODEL loaded. Continuing training ...\n");
-
+        printf("[train] Model parameters successfully loaded. Continuing training...\n");
     } else {
         printf("[train] Creating new model (hidden_size=%d)...\n", config.hidden_size);
-
         rnn = rnn_create(vocab_size, config.hidden_size);
         dense = dense_create(config.hidden_size, vocab_size, ACT_SOFTMAX);
-         
-    
     }
 
-    //  the above line can save the funtions in load all the model.bin files
-
-    /*
-    printf("[train] Creating model (hidden_size=%d)...\n", config.hidden_size);
-    RNNLayer   *rnn = rnn_create(vocab_size, config.hidden_size);
-    // ACT_SOFTMAX, not ACT_NONE: nn_loss(LOSS_CROSS_ENTROPY,...)'s
-     * combined (p-t) gradient (see nn.c) assumes `pred` is already a
-     * genuine softmax probability, and dense_backward()'s ACT_SOFTMAX
-     * case correspondingly passes that gradient straight through as
-     * dz without re-differentiating softmax. Both halves only agree
-     * with each other when this layer is ACT_SOFTMAX. (Contrast with
-     * pipeline.c, which deliberately uses ACT_NONE at INFERENCE time
-     * to get raw logits for temperature/top-p sampling — a different
-     * stage with a different requirement.) */
-   /*DenseLayer *dense = dense_create(config.hidden_size, vocab_size, ACT_SOFTMAX);*/
-
-    /* Built only so sgd_step() can dispatch per-layer-type updates to
-     * these same rnn/dense pointers — see note (a) at the top of this
-     * file. Forward/backward below never goes through this Network. */
     Network *net = nn_create();
     nn_add_rnn(net, rnn);
     nn_add_dense(net, dense);
@@ -502,8 +528,6 @@ int main(int argc, char **argv) {
            (double)config.learning_rate, (double)MOMENTUM, (double)WEIGHT_DECAY);
     SGD *opt = sgd_create(config.learning_rate, MOMENTUM, WEIGHT_DECAY);
 
-    /* Reused every step — sized once, never resized (batch_size/seq_len
-     * are fixed for the whole run), avoiding per-step malloc/free. */
     uint32_t *input_ids  = (uint32_t *)malloc((size_t)config.batch_size * config.seq_len * sizeof(uint32_t));
     uint32_t *target_ids = (uint32_t *)malloc((size_t)config.batch_size * config.seq_len * sizeof(uint32_t));
 
@@ -524,11 +548,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* One epoch = a fixed number of batches derived from corpus size.
-     * dataset_next_batch() itself has no notion of an "epoch boundary"
-     * (it streams indefinitely via wraparound — see dataset_loader.c's
-     * own header comment) — this file layers "epoch" on top purely by
-     * counting a fixed number of steps per epoch. */
     {
         size_t tokens_per_batch = (size_t)config.batch_size * config.seq_len;
         int steps_per_epoch = (int)(ds->token_count / tokens_per_batch);
@@ -538,6 +557,7 @@ int main(int argc, char **argv) {
                steps_per_epoch, config.epochs, config.batch_size, config.seq_len);
 
         float prev_loss = 1e9f;
+        float best_loss = 1e9f;
         int plateau_count = 0;
 
         for (int epoch = 0; epoch < config.epochs; epoch++) {
@@ -546,26 +566,13 @@ int main(int argc, char **argv) {
             for (int step = 0; step < steps_per_epoch; step++) {
                 if (dataset_next_batch(ds, input_ids, target_ids,
                                        config.batch_size, config.seq_len) != 0) {
-                    fprintf(stderr, "train: dataset_next_batch failed at "
-                                    "epoch %d step %d\n", epoch, step);
+                    fprintf(stderr, "train: dataset_next_batch failed at epoch %d step %d\n", epoch, step);
                     goto cleanup;
                 }
 
                 fill_onehot_3d(input3d, input_ids, config.batch_size, config.seq_len, vocab_size);
-                fill_onehot_2d(target2d, target_ids,
-                                config.batch_size * config.seq_len, vocab_size);
+                fill_onehot_2d(target2d, target_ids, config.batch_size * config.seq_len, vocab_size);
 
-                /* forward: RNN over the whole sequence, then Dense
-                 * per-timestep via a reshape view (no copy — see note
-                 * (a) at the top of this file). rnn_out_2d must stay
-                 * alive until AFTER dense_backward() below: DenseLayer
-                 * caches the pointer it was called with in l->input
-                 * (see layer.c's dense_forward — "cache input pointer
-                 * (not owned)") and reads it again during
-                 * dense_backward()'s dW computation. Freeing this view
-                 * right after dense_forward() leaves that a dangling
-                 * pointer — confirmed via ASan during testing, this is
-                 * not a hypothetical. */
                 rnn_forward(rnn, input3d, /*h_init=*/NULL, rnn_out3d);
                 Tensor *rnn_out_2d = tensor_reshape(rnn_out3d, sh_2d_h, 2);
                 dense_forward(dense, rnn_out_2d, dense_out);
@@ -573,20 +580,12 @@ int main(int argc, char **argv) {
                 float loss = nn_loss(LOSS_CROSS_ENTROPY, dense_out, target2d, loss_grad);
                 total_loss += loss;
 
-                /* backward: Dense first (still using rnn_out_2d via
-                 * its cached l->input), THEN free that view, then
-                 * reshape dense->dX back to 3D for the RNN's own BPTT */
                 dense_backward(dense, loss_grad);
-                tensor_free(rnn_out_2d);   /* safe now — dense_backward() is done reading it */
+                tensor_free(rnn_out_2d);
                 Tensor *dX_3d = tensor_reshape(dense->dX, sh_out3, 3);
                 rnn_backward(rnn, dX_3d);
-                tensor_free(dX_3d);   /* view only */
+                tensor_free(dX_3d);
 
-                /* clip BOTH layers' gradients — nn_clip_gradients()
-                 * (optimizer.c) only ever touches Dense's dW/db (see
-                 * its own header comment), so the RNN needs its own
-                 * clip call too, or exploding BPTT gradients on the
-                 * recurrent weights would go completely unchecked. */
                 rnn_clip_gradients(rnn, GRAD_CLIP_NORM);
                 nn_clip_gradients(net, GRAD_CLIP_NORM);
 
@@ -612,16 +611,23 @@ int main(int argc, char **argv) {
             }
 
             prev_loss = avg_loss;
-            printf("Epoch %d | Loss: %.4f\n", epoch, avg_loss);
+            printf("Epoch %d | Loss: %.4f\n", epoch + 1, avg_loss);
+
+            /* Save epoch historical snapshot: checkpoint_epoch_<N>.bin */
+            save_checkpoint(rnn, dense, vocab_size, config.hidden_size, epoch + 1);
+
+            /* Always update latest model checkpoint: model.bin */
+            save_model(model_path, rnn, dense, vocab_size, config.hidden_size);
+
+            /* Track and save best model if loss improved */
+            if (avg_loss < best_loss) {
+                best_loss = avg_loss;
+                save_best_checkpoint(rnn, dense, vocab_size, config.hidden_size, avg_loss);
+            }
         }
     }
 
-    printf("[train] Saving model to '%s'...\n", model_path);
-    if (save_model(model_path, rnn, dense, vocab_size, config.hidden_size) != 0) {
-        fprintf(stderr, "train: failed to save model\n");
-    } else {
-        printf("[train] Done.\n");
-    }
+    printf("[train] Final model saved to '%s'. Done.\n", model_path);
 
 cleanup:
     free(input_ids);
