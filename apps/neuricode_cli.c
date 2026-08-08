@@ -1,5 +1,5 @@
 /*
- * neuricode_cli.c — Antigravity AI Terminal Assistant with 8 Color Themes
+ * neuricode_cli.c — AI Terminal Assistant with 8 Color Themes
  */
 
 #define _DEFAULT_SOURCE
@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "tui.h"
 #include "pipeline.h"
@@ -289,10 +290,192 @@ static void run_generation(Pipeline *pipeline, Tokenizer *tokenizer,
     printf("\n");
 }
 
+#define MAX_MODEL_BINS 64
+#define BIN_PATH_LEN 256
+
+static int list_model_bins(char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN]) {
+    int count = 0;
+    DIR *d = opendir(".");
+    if (!d) return 0;
+
+    struct dirent *dir;
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_type == DT_REG || dir->d_type == DT_UNKNOWN) {
+            const char *dot = strrchr(dir->d_name, '.');
+            if (dot && strcmp(dot, ".bin") == 0) {
+                if (count < MAX_MODEL_BINS) {
+                    snprintf(bin_files[count], BIN_PATH_LEN, "%s", dir->d_name);
+                    count++;
+                }
+            }
+        }
+    }
+    closedir(d);
+
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (strcmp(bin_files[i], bin_files[j]) > 0) {
+                char tmp[BIN_PATH_LEN];
+                memcpy(tmp, bin_files[i], BIN_PATH_LEN);
+                memcpy(bin_files[i], bin_files[j], BIN_PATH_LEN);
+                memcpy(bin_files[j], tmp, BIN_PATH_LEN);
+            }
+        }
+    }
+
+    return count;
+}
+
+static int find_latest_bin(const char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN], int count, char *out_path, size_t out_sz) {
+    if (count <= 0) return 0;
+
+    int max_epoch = -1;
+    int best_epoch_idx = -1;
+    int checkpoint_best_idx = -1;
+    int model_bin_idx = -1;
+
+    for (int i = 0; i < count; i++) {
+        int ep = -1;
+        if (sscanf(bin_files[i], "checkpoint_epoch_%d.bin", &ep) == 1) {
+            if (ep > max_epoch) {
+                max_epoch = ep;
+                best_epoch_idx = i;
+            }
+        } else if (strcmp(bin_files[i], "checkpoint_best.bin") == 0) {
+            checkpoint_best_idx = i;
+        } else if (strcmp(bin_files[i], "model.bin") == 0) {
+            model_bin_idx = i;
+        }
+    }
+
+    int selected_idx = 0;
+    if (best_epoch_idx >= 0) {
+        selected_idx = best_epoch_idx;
+    } else if (checkpoint_best_idx >= 0) {
+        selected_idx = checkpoint_best_idx;
+    } else if (model_bin_idx >= 0) {
+        selected_idx = model_bin_idx;
+    } else {
+        time_t newest_time = 0;
+        for (int i = 0; i < count; i++) {
+            struct stat st;
+            if (stat(bin_files[i], &st) == 0) {
+                if (st.st_mtime > newest_time) {
+                    newest_time = st.st_mtime;
+                    selected_idx = i;
+                }
+            }
+        }
+    }
+
+    snprintf(out_path, out_sz, "%s", bin_files[selected_idx]);
+    return 1;
+}
+
+static int load_selected_bin(const char *target_path, Pipeline **pipeline_ptr, char *active_model_path, size_t path_sz) {
+    if (!target_path || target_path[0] == '\0') {
+        tui_log_error("Invalid model path specified.");
+        return 0;
+    }
+
+    struct stat st;
+    if (stat(target_path, &st) != 0) {
+        tui_log_error("Model checkpoint '%s' not found.", target_path);
+        return 0;
+    }
+
+    tui_log_info("Switching model binary to '%s'...", target_path);
+
+#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
+    if (g_trans_model) {
+        if (transformer_load_weights(g_trans_model, target_path) != 0) {
+            tui_log_warn("Failed to reload Transformer weights from '%s'.", target_path);
+        }
+    }
+#endif
+
+    Pipeline *new_pipe = pipeline_load(target_path);
+    if (!new_pipe) {
+        tui_log_error("Failed to load pipeline from model binary '%s'.", target_path);
+        return 0;
+    }
+
+    if (*pipeline_ptr) {
+        pipeline_free(*pipeline_ptr);
+    }
+    *pipeline_ptr = new_pipe;
+    pipeline_reset(*pipeline_ptr);
+
+    snprintf(active_model_path, path_sz, "%s", target_path);
+    tui_log_success("Successfully loaded and active on model '%s'!", target_path);
+    return 1;
+}
+
+static void handle_bin_command(const char *args, Pipeline **pipeline_ptr, char *active_model_path, size_t path_sz) {
+    char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN];
+    int count = list_model_bins(bin_files);
+
+    if (count == 0) {
+        tui_log_warn("No '.bin' model checkpoints found in current directory.");
+        return;
+    }
+
+    while (*args == ' ') args++;
+
+    if (strcmp(args, "auto") == 0) {
+        char auto_target[256];
+        if (find_latest_bin(bin_files, count, auto_target, sizeof(auto_target))) {
+            tui_log_info("[bin auto] Selected latest checkpoint '%s'", auto_target);
+            load_selected_bin(auto_target, pipeline_ptr, active_model_path, path_sz);
+        } else {
+            tui_log_warn("Could not determine latest checkpoint.");
+        }
+        return;
+    }
+
+    if (args[0] != '\0') {
+        int idx = atoi(args);
+        if (idx > 0 && idx <= count) {
+            load_selected_bin(bin_files[idx - 1], pipeline_ptr, active_model_path, path_sz);
+            return;
+        } else if (access(args, F_OK) == 0) {
+            load_selected_bin(args, pipeline_ptr, active_model_path, path_sz);
+            return;
+        } else {
+            tui_log_error("Invalid selection or file '%s' not found.", args);
+            return;
+        }
+    }
+
+    const Theme *th = tui_get_theme();
+    printf("\n%s[DISCOVERED MODEL CHECKPOINTS (%d found)]%s\n", th->primary, count, ANSI_RESET);
+    for (int i = 0; i < count; i++) {
+        int is_current = (strcmp(bin_files[i], active_model_path) == 0);
+        printf("  %s[%d]%s %-32s %s\n",
+               th->primary, i + 1, ANSI_RESET,
+               bin_files[i],
+               is_current ? "\033[32m(ACTIVE)\033[0m" : "");
+    }
+
+    char sel_input[64];
+    if (tui_readline("Select model number to load (1-N, 0 to cancel): ", sel_input, sizeof(sel_input))) {
+        sel_input[strcspn(sel_input, "\r\n")] = '\0';
+        int sel = atoi(sel_input);
+        if (sel > 0 && sel <= count) {
+            load_selected_bin(bin_files[sel - 1], pipeline_ptr, active_model_path, path_sz);
+        } else if (sel == 0) {
+            tui_log_info("Model selection cancelled.");
+        } else {
+            tui_log_error("Selection out of bounds [1-%d].", count);
+        }
+    }
+}
+
 static void print_help_menu(void) {
     const Theme *th = tui_get_theme();
     printf("\n%s[NEURICODE COMMANDS]%s\n", th->primary, ANSI_RESET);
     printf("  %s/help%s         - Display help manual\n", th->primary, ANSI_RESET);
+    printf("  %s/bin [auto|num]%s - Scan, switch, or auto-load .bin model checkpoints\n", th->primary, ANSI_RESET);
     printf("  %s/theme%s        - Open interactive arrow-key theme selector (8 themes)\n", th->primary, ANSI_RESET);
     printf("  %s/status%s       - Display live system status & parameters\n", th->primary, ANSI_RESET);
     printf("  %s/temp <val>%s   - Set sampling temperature (current: %.2f)\n", th->primary, ANSI_RESET, g_temperature);
@@ -365,7 +548,7 @@ int main(int argc, char **argv) {
     }
 
     tui_clear_screen();
-    tui_print_header_banner("v1.0", model_path);
+    tui_print_header_banner("1.1.0", model_path);
 
 #if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
     g_trans_model = transformer_init_from_config();
@@ -405,11 +588,22 @@ int main(int argc, char **argv) {
 
     char input[INPUT_BYTES];
     while (1) {
-        tui_print_antigravity_input_frame_start();
+        int width = tui_get_terminal_width();
+        const Theme *th = tui_get_theme();
 
-        if (!fgets(input, sizeof(input), stdin)) break;
+        printf("\n%s", th->muted);
+        for (int i = 0; i < width; i++) printf("─");
+        printf("%s\n", ANSI_RESET);
 
-        tui_print_antigravity_input_frame_end();
+        char prompt_buf[128];
+        snprintf(prompt_buf, sizeof(prompt_buf), "%s%s> %s", ANSI_BOLD, th->prompt, ANSI_RESET);
+
+        if (!tui_readline(prompt_buf, input, sizeof(input))) break;
+
+        printf("%s", th->muted);
+        for (int i = 0; i < width; i++) printf("─");
+        printf("%s\n", ANSI_RESET);
+        fflush(stdout);
 
         input[strcspn(input, "\r\n")] = '\0';
         if (input[0] == '\0') continue;
@@ -432,7 +626,7 @@ int main(int argc, char **argv) {
             continue;
         } else if (strcmp(input, "/clear") == 0) {
             tui_clear_screen();
-            tui_print_header_banner("v1.0", model_path);
+            tui_print_header_banner("1.1.0", model_path);
             continue;
         } else if (strncmp(input, "/temp ", 6) == 0) {
             float t = strtof(input + 6, NULL);
@@ -451,6 +645,12 @@ int main(int argc, char **argv) {
             } else {
                 tui_log_warn("Invalid Top-K value.");
             }
+            continue;
+        } else if (strcmp(input, "/bin") == 0) {
+            handle_bin_command("", &pipeline, model_path, sizeof(model_path));
+            continue;
+        } else if (strncmp(input, "/bin ", 5) == 0) {
+            handle_bin_command(input + 5, &pipeline, model_path, sizeof(model_path));
             continue;
         } else if (strcmp(input, "/reset") == 0) {
             pipeline_reset(pipeline);
