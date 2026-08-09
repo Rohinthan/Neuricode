@@ -16,9 +16,9 @@
 
 ## Creator's Vision & Why Neuricode is Unique
 
-Modern Artificial Intelligence is heavily reliant on massive 2–5 GB Python frameworks (PyTorch, TensorFlow) requiring Python interpreters, CUDA toolchains, and expensive GPUs. Conversely, C++ inference engines (like `llama.cpp` or `ONNX Runtime`) focus strictly on executing pre-trained models and require C++ runtimes and complex build pipelines.
+Modern Artificial Intelligence is heavily reeliant on massive 2–5 GB Python frameworks (PyTorch, TensorFlow) requiring Python interpreters, CUDA toolchains, and expensive GPUs. Conversely, C++ inference engines (like `llama.cpp` or `ONNX Runtime`) focus strictly on executing pre-trained models and require C++ runtimes and complex build pipelines.
 
-**Neuricode v1 was engineered to bridge this gap.** Built entirely in standard C (C11/POSIX) with **zero external library dependencies**, Neuricode v1 provides a unified engine for both training (backpropagation) and generative inference. It boots in under **2 milliseconds** and runs natively on resource-constrained embedded platforms—including **Raspberry Pi, NVIDIA Jetson, microcontrollers, edge IoT devices, and Linux servers**.
+**Neuricode was engineered to bridge this gap.** Built entirely in standard C (C11/POSIX) with **zero external library dependencies**, Neuricode provides a unified engine for both training (backpropagation) and generative inference. It boots in under **2 milliseconds** and runs natively on resource-constrained embedded platforms—including **Raspberry Pi, NVIDIA Jetson, microcontrollers, edge IoT devices, and Linux servers**.
 
 ---
 
@@ -146,6 +146,7 @@ Inside `neuricode`, use `/` commands to control execution:
 | `/reset` | Reset model hidden state memory |
 | `/clear` | Clear terminal screen |
 | `/exit` | Exit Neuricode CLI |
+| `/bin`  | change bin in realtime |
 
 ---
 
