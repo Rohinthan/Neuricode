@@ -275,8 +275,7 @@ void dense_backward(DenseLayer *l, const Tensor *grad_out) {
                 l->dW->data[o*in_f + i] += dzbo * l->input->data[b*in_f + i];
         }
     }
-    /* average over batch */
-    tensor_scale(l->dW, 1.0f / batch, l->dW);
+    /* Note: dz is already scaled by 1/batch in nn_loss for LOSS_CROSS_ENTROPY */
 
     /* db = mean over batch of dz  [out_f]                         */
     /* Parallel over o with local sum — no race condition           */
@@ -288,7 +287,7 @@ void dense_backward(DenseLayer *l, const Tensor *grad_out) {
         float sum = 0.0f;
         for (int b = 0; b < batch; b++)
             sum += dz->data[b*out_f + o];
-        l->db->data[o] = sum / (float)batch;
+        l->db->data[o] = sum;
     }
 
     /* dX = dz @ W  [batch, in_f]                                  */
