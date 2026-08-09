@@ -240,11 +240,8 @@ void rnn_backward(RNNLayer *l, const Tensor *grad_out) {
             }
     }
 
-    /* average gradients over batch and seq */
-    float scale = 1.0f / (float)(batch * seq);
-    tensor_scale(l->dW_xh, scale, l->dW_xh);
-    tensor_scale(l->dW_hh, scale, l->dW_hh);
-    tensor_scale(l->db_h,  scale, l->db_h);
+    /* dz is already scaled by 1/(batch*seq) from loss_grad via dX */
+    /* no extra scale needed */
 
     tensor_free(dh_next);
     tensor_free(dz);
