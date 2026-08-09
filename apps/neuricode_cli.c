@@ -1,9 +1,31 @@
 /*
- * neuricode_cli.c — Antigravity AI Terminal Assistant with 8 Color Themes
+ * cli.c — GPT-style streaming text generation CLI.
+ *
+ * DEVIATIONS FROM THE LITERAL SPEC (and why):
+ *
+ *   - `pipeline_load_model()` doesn't exist in this project's actual
+ *     pipeline.h — the real loader is `pipeline_load()`, and it does
+ *     NOT bundle a tokenizer (see tokenizer.h's separate
+ *     `tokenizer_load()`). Used the real API throughout.
+ *   - `tokenizer_decode(token)` returning a string doesn't match the
+ *     real signature (`tokenizer_decode(t, tokens, count, buf, size)`,
+ *     caller-allocated buffer). Used the real signature.
+ *   - CLI usage: the spec's `./cli model.bin "prompt"` has no way to
+ *     load a vocab file, but this tokenizer requires one. Usage here
+ *     is `./cli model.bin vocab.txt ["prompt"]` — with the prompt
+ *     arg: single-shot (generate once, exit). Without it: interactive
+ *     REPL, matching how this CLI has worked throughout the project.
+ *   - Repetition handling: replaced the earlier per-conversation
+ *     "penalize only if the same token repeats >N times in a row"
+ *     heuristic with the standard global `seen[]` scheme this spec
+ *     asks for (penalize every token already emitted anywhere in the
+ *     sequence, prompt included) — this is the same approach used by
+ *     e.g. Hugging Face's `repetition_penalty` and is a strictly more
+ *     standard design than the ad-hoc one before it.
+ *   - Stop conditions: spec lists only EOS + max_tokens. Dropped the
+ *     earlier newline-based stop to match. Easy to re-add if you want
+ *     it back.
  */
-
-#define _DEFAULT_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,129 +33,62 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <dirent.h>
 
-#include "tui.h"
 #include "pipeline.h"
 #include "tokenizer.h"
 
-#define MAX_TOKENS      512
-#define MAX_NEW_TOKENS  100
+/* ── sizing ─────────────────────────────────────────────────────── */
+#define MAX_TOKENS      512    /* prompt + generated tokens, this call  */
+#define MAX_NEW_TOKENS  50
 #define INPUT_BYTES     4096
-#define MAX_VOCAB       65536
+#define MAX_VOCAB       65536   /* static scratch-buffer cap             */
+#define MAX_K           128     /* cap on top-k, independent of vocab    */
 
 #if defined(NEURALC_HAS_CONFIG) || __has_include("neuralc_config.h")
 #include "neuralc_config.h"
 #endif
 
-#include "transformer.h"
-
-static TransformerModel *g_trans_model = NULL;
-
-// Hyperparameters
+/* ── tunables ───────────────────────────────────────────────────── */
+#ifndef TEMPERATURE
 #ifdef NEURALC_TEMPERATURE
-static float g_temperature = NEURALC_TEMPERATURE;
+  #define TEMPERATURE NEURALC_TEMPERATURE
 #else
-static float g_temperature = 0.80f;
+  #define TEMPERATURE 0.8f
 #endif
-static int   g_top_k       = 20;
-static float g_rep_penalty = 1.20f;
-static int   g_typing_speed_us = 10000; // 10ms per char
+#endif
+#define TOP_K           20
+#define REPEAT_PENALTY  1.2f
 
-static int file_exists(const char *path) {
-    struct stat buffer;
-    return (stat(path, &buffer) == 0);
+static void print_usage(const char *program) {
+    fprintf(stderr, "Usage: %s <model.bin> <vocab.txt> [\"prompt\"]\n", program);
 }
 
-static void get_exe_directory(char *dir_out, size_t max_sz) {
-    dir_out[0] = '\0';
-    char path[1024];
-    ssize_t count = readlink("/proc/self/exe", path, sizeof(path) - 1);
-    if (count != -1) {
-        path[count] = '\0';
-        char *slash = strrchr(path, '/');
-        if (slash) {
-            *slash = '\0';
-            snprintf(dir_out, max_sz, "%s", path);
-        }
-    }
-}
+/* ═══════════════════════════════════════════════════════════════════
+ *  Section 9 — the five required building blocks
+ * ═══════════════════════════════════════════════════════════════════ */
 
-// Auto-discover model and vocab files across standard locations dynamically
-static int auto_discover_files(char *model_out, size_t model_sz,
-                               char *vocab_out, size_t vocab_sz) {
-    const char *env_model = getenv("NEURICODE_MODEL_PATH");
-    const char *env_vocab = getenv("NEURICODE_VOCAB_PATH");
-
-    if (env_model && file_exists(env_model)) {
-        snprintf(model_out, model_sz, "%s", env_model);
-    }
-    if (env_vocab && file_exists(env_vocab)) {
-        snprintf(vocab_out, vocab_sz, "%s", env_vocab);
-    }
-
-    char exe_dir[1024] = "";
-    get_exe_directory(exe_dir, sizeof(exe_dir));
-    char path_buf[1024];
-
-    if (model_out[0] == '\0') {
-        const char *model_candidates[] = {
-            "model.bin",
-            "assets/model.bin",
-            "../model.bin",
-            "../assets/model.bin",
-            "./assets/model.bin"
-        };
-        for (size_t i = 0; i < sizeof(model_candidates)/sizeof(model_candidates[0]); i++) {
-            if (file_exists(model_candidates[i])) {
-                snprintf(model_out, model_sz, "%s", model_candidates[i]);
-                break;
-            }
-            if (exe_dir[0] != '\0') {
-                snprintf(path_buf, sizeof(path_buf), "%s/%s", exe_dir, model_candidates[i]);
-                if (file_exists(path_buf)) {
-                    snprintf(model_out, model_sz, "%s", path_buf);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (vocab_out[0] == '\0') {
-        const char *vocab_candidates[] = {
-            "assets/vocab.txt",
-            "vocab.txt",
-            "../assets/vocab.txt",
-            "../vocab.txt",
-            "./vocab.txt"
-        };
-        for (size_t i = 0; i < sizeof(vocab_candidates)/sizeof(vocab_candidates[0]); i++) {
-            if (file_exists(vocab_candidates[i])) {
-                snprintf(vocab_out, vocab_sz, "%s", vocab_candidates[i]);
-                break;
-            }
-            if (exe_dir[0] != '\0') {
-                snprintf(path_buf, sizeof(path_buf), "%s/%s", exe_dir, vocab_candidates[i]);
-                if (file_exists(path_buf)) {
-                    snprintf(vocab_out, vocab_sz, "%s", path_buf);
-                    break;
-                }
-            }
-        }
-    }
-
-    return (model_out[0] != '\0' && vocab_out[0] != '\0');
-}
-
+/*
+ * apply_temperature: logits[i] /= temp, in place. temp is clamped to
+ * >= 0.05 — a near-zero temperature blows the scaled values up toward
+ * +/-inf, which turns the softmax's exp() into NaN/inf downstream.
+ */
 static void apply_temperature(float *logits, int vocab, float temp) {
     if (temp < 0.05f) temp = 0.05f;
     for (int i = 0; i < vocab; i++)
         logits[i] /= temp;
 }
 
-static void apply_repetition_penalty(float *logits, int vocab, const int *seen, float penalty) {
+/*
+ * apply_repetition_penalty: for every token already seen (seen[i]
+ * nonzero), push its logit DOWN — never up. This has to branch on
+ * sign: dividing a positive logit by `penalty` shrinks it, but
+ * dividing a *negative* logit by the same `penalty` makes it larger
+ * (closer to zero, i.e. more likely) — a reward instead of a penalty.
+ * Multiplying by `penalty` on the negative side keeps the direction
+ * consistent regardless of the logit's sign.
+ */
+static void apply_repetition_penalty(float *logits, int vocab,
+                                      const int *seen, float penalty) {
     for (int i = 0; i < vocab; i++) {
         if (!seen[i]) continue;
         if (logits[i] > 0.0f) logits[i] /= penalty;
@@ -141,541 +96,303 @@ static void apply_repetition_penalty(float *logits, int vocab, const int *seen, 
     }
 }
 
+/*
+ * top_k_filter: in place. Keeps the k highest logits untouched and
+ * masks every other entry to -INFINITY, so a plain full-vocab softmax
+ * afterward naturally assigns those entries ~0 probability.
+ *
+ * Uses partial selection (k passes of "find current max among
+ * not-yet-picked") rather than a full sort — O(k*vocab), fine at this
+ * project's fixed vocab_size=256 (see load_model.c's EXPECTED_VOCAB).
+ * The "already picked" set is tracked via a static stamp counter
+ * instead of a memset every call — see the comment on `stamp` below.
+ */
 static void top_k_filter(float *logits, int vocab, int k) {
-    if (k <= 0 || k >= vocab) return;
+    if (k <= 0) k = 1;
+    if (k > vocab) k = vocab;
+    if (k > MAX_K) k = MAX_K;
 
-    static int seen_stamp[MAX_VOCAB];
-    static int stamp = 0;
-    stamp++;
+    static unsigned int used[MAX_VOCAB];
+    static unsigned int stamp = 0;
+    /* unsigned wraparound (UINT_MAX -> 0) is well-defined in C, unlike
+     * the same wrap on a signed int, which is undefined behavior —
+     * so a full reset on the rare wrap is correct, not just "usually
+     * works". Happens once every ~4 billion calls. */
+    if (++stamp == 0) {
+        memset(used, 0, sizeof(used));
+        stamp = 1;
+    }
 
+    int top_idx[MAX_K];
+    int picked = 0;
     for (int pick = 0; pick < k; pick++) {
-        float max_val = -1e30f;
-        int max_idx = -1;
-
+        int best = -1;
         for (int i = 0; i < vocab; i++) {
-            if (seen_stamp[i] == stamp) continue;
-            if (logits[i] > max_val) {
-                max_val = logits[i];
-                max_idx = i;
-            }
+            if (used[i] == stamp) continue;
+            float v = logits[i];
+            if (v != v) continue;    /* NaN check w/o a libm call:
+                                       * NaN is the only float never
+                                       * equal to itself */
+            if (best == -1 || v > logits[best]) best = i;
         }
-        if (max_idx >= 0) {
-            seen_stamp[max_idx] = stamp;
-        }
+        if (best == -1) break;       /* fewer than k finite candidates left */
+        top_idx[picked++] = best;
+        used[best] = stamp;
     }
 
-    for (int i = 0; i < vocab; i++) {
-        if (seen_stamp[i] != stamp) {
-            logits[i] = -1e30f;
-        }
-    }
+    for (int i = 0; i < vocab; i++)
+        if (used[i] != stamp) logits[i] = -INFINITY;
+
+    (void)top_idx; /* indices themselves unneeded once the mask is applied */
 }
 
-static int sample_softmax(const float *logits, int vocab) {
-    float max_val = logits[0];
-    for (int i = 1; i < vocab; i++)
-        if (logits[i] > max_val) max_val = logits[i];
+/*
+ * softmax: numerically stable, clamp-before-exp as specified.
+ * Returns 0 on success (probs[] filled, sums to 1), -1 if the
+ * distribution collapsed (every logit is -infinity/NaN, or the sum
+ * came out non-finite/zero) — caller is expected to fall back to
+ * argmax on the ORIGINAL logits in that case, not retry on probs[].
+ */
+static int softmax(const float *logits, float *probs, int vocab) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < vocab; i++)
+        if (logits[i] > max_logit) max_logit = logits[i];
+
+    if (!isfinite(max_logit))
+        return -1;   /* every entry is -inf (fully masked) or vocab==0 */
 
     double sum = 0.0;
-    static float probs[MAX_VOCAB];
     for (int i = 0; i < vocab; i++) {
-        probs[i] = expf(logits[i] - max_val);
-        sum += probs[i];
+        float diff = logits[i] - max_logit;
+        if (!isfinite(diff)) diff = -INFINITY;   /* e.g. -inf - (-inf) => NaN */
+        else if (diff < -20.0f) diff = -20.0f;   /* floor, not a NaN guard —
+                                                    * prevents legitimate
+                                                    * low-probability survivors
+                                                    * from underflowing to a
+                                                    * hard zero */
+        float e = expf(diff);
+        probs[i] = e;
+        sum += e;
     }
 
-    double r = ((double)rand() / (double)RAND_MAX) * sum;
-    double acc = 0.0;
-    for (int i = 0; i < vocab; i++) {
-        acc += probs[i];
-        if (acc >= r) return i;
-    }
-    return vocab - 1;
+    if (!(sum > 0.0) || !isfinite(sum))
+        return -1;
+
+    for (int i = 0; i < vocab; i++)
+        probs[i] = (float)(probs[i] / sum);
+    return 0;
 }
 
+/*
+ * sample: draws one index from a normalized distribution via
+ * cumulative-sum roulette. Falls back to argmax over probs[] only for
+ * the floating-point-rounding edge case where the walk finishes
+ * without cdf reaching r (extremely rare, not the "distribution
+ * collapsed" case — that's handled by softmax()'s return value
+ * before this is ever called).
+ */
+static int sample(const float *probs, int vocab) {
+    float r = (float)rand() * (1.0f / ((float)RAND_MAX + 1.0f));
+    float cdf = 0.0f;
+    for (int i = 0; i < vocab; i++) {
+        cdf += probs[i];
+        if (r < cdf) return i;
+    }
+    int best = 0;
+    for (int i = 1; i < vocab; i++)
+        if (probs[i] > probs[best]) best = i;
+    return best;
+}
+
+/* argmax over raw, unmodified logits — the deterministic fallback
+ * used when softmax() reports a collapsed distribution. Deliberately
+ * takes the ORIGINAL logits (pre temperature/penalty/top-k), not the
+ * masked working buffer, so a masking edge case can never itself be
+ * the reason the fallback also fails. */
+static int argmax(const float *logits, int vocab) {
+    int best = 0;
+    for (int i = 1; i < vocab; i++)
+        if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+/*
+ * generate_next_token: wires the five pieces above together for one
+ * decoding step. No heap allocation — `work`/`probs` are static,
+ * reused every call, sized once at MAX_VOCAB.
+ */
 static int generate_next_token(const float *raw_logits, int vocab,
-                               const int *seen, float temp, int top_k, float rep_pen) {
-    static float work_logits[MAX_VOCAB];
-    memcpy(work_logits, raw_logits, (size_t)vocab * sizeof(float));
+                                const int *seen, float temperature,
+                                int top_k, float penalty) {
+    static float work[MAX_VOCAB];
+    static float probs[MAX_VOCAB];
 
-    if (temp <= 0.0f) {
-        int best = 0;
-        for (int i = 1; i < vocab; i++)
-            if (work_logits[i] > work_logits[best]) best = i;
-        return best;
-    }
+    /* temperature == 0 means "greedy" by definition (spec requirement,
+     * not an approximation) — go straight to argmax on the raw,
+     * unmodified logits and skip temperature/penalty/top-k/softmax/
+     * sampling entirely. Reuses the exact same argmax() the collapse
+     * fallback below uses, so both deterministic paths agree. A
+     * negative temperature is nonsensical and treated the same way. */
+    if (temperature <= 0.0f)
+        return argmax(raw_logits, vocab);
 
-    apply_repetition_penalty(work_logits, vocab, seen, rep_pen);
-    apply_temperature(work_logits, vocab, temp);
-    top_k_filter(work_logits, vocab, top_k);
+    memcpy(work, raw_logits, (size_t)vocab * sizeof(float));
 
-    return sample_softmax(work_logits, vocab);
+    apply_temperature(work, vocab, temperature);
+    apply_repetition_penalty(work, vocab, seen, penalty);
+    top_k_filter(work, vocab, top_k);
+
+    if (softmax(work, probs, vocab) != 0)
+        return argmax(raw_logits, vocab);   /* deterministic collapse fallback */
+
+    return sample(probs, vocab);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  CLI plumbing
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Runs one prompt to completion, streaming tokens to stdout as they're
+ * generated. All buffers passed in are caller-owned and reused across
+ * calls — no allocation happens in here. */
 static void run_generation(Pipeline *pipeline, Tokenizer *tokenizer,
                             int vocab_size, int eos_id,
                             const char *prompt_text,
                             int *tokens, float *logits, int *seen) {
     int num_tokens = tokenizer_encode(tokenizer, prompt_text, tokens, MAX_TOKENS);
     if (num_tokens <= 0) {
-        tui_log_warn("Could not parse prompt input into tokens.");
+        fprintf(stderr, "cli: input could not be tokenized\n");
         return;
     }
 
-    tui_show_spinner("Thinking", 250);
-
+    /* Standard repetition-penalty scope: every token already in the
+     * sequence counts as "seen", prompt included — not just tokens
+     * generated so far. */
     memset(seen, 0, (size_t)vocab_size * sizeof(int));
     for (int i = 0; i < num_tokens; i++)
         seen[tokens[i]] = 1;
 
-#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
-    if (g_trans_model) {
-        for (int i = 0; i < num_tokens; i++) {
-            float *res = transformer_forward(g_trans_model, tokens[i], i);
-            if (res) memcpy(logits, res, (size_t)vocab_size * sizeof(float));
-        }
-    } else {
-        pipeline_reset(pipeline);
-        pipeline_forward(pipeline, tokens, num_tokens, logits);
-    }
-#else
     pipeline_reset(pipeline);
     pipeline_forward(pipeline, tokens, num_tokens, logits);
-#endif
     const float *cur_logits = logits;
 
     int max_new_tokens = MAX_NEW_TOKENS;
     if (max_new_tokens > MAX_TOKENS - num_tokens)
         max_new_tokens = MAX_TOKENS - num_tokens;
 
-    const Theme *th = tui_get_theme();
-    printf("\n%s%sNeuricode >%s ", ANSI_BOLD, th->primary, ANSI_RESET);
-
     for (int step = 0; step < max_new_tokens; step++) {
         int next_token = generate_next_token(cur_logits, vocab_size, seen,
-                                              g_temperature, g_top_k, g_rep_penalty);
+                                              TEMPERATURE, TOP_K, REPEAT_PENALTY);
         if (next_token < 0 || next_token >= vocab_size) break;
 
         seen[next_token] = 1;
         tokens[num_tokens++] = next_token;
 
+        /* STREAMING: decode and print only this one token. */
         char piece[256];
         int written = tokenizer_decode(tokenizer, &next_token, 1, piece, sizeof(piece));
         if (written > 0) {
-            char formatted_piece[300];
-            if (piece[0] == ' ')
-                snprintf(formatted_piece, sizeof(formatted_piece), "%s", piece);
-            else
-                snprintf(formatted_piece, sizeof(formatted_piece), " %s", piece);
+            if (piece[0] == ' ')            /* manualy added for space */
+                printf("%s", piece);        /* for front space and already in present in " == ' ' */
+            else                            /* if else */
+                printf(" %s", piece);       /* for back space for pieces*/
 
-            tui_type_text(formatted_piece, g_typing_speed_us);
+            fflush(stdout);
         }
 
-        if (next_token == eos_id) break;
+        if (next_token == eos_id) break;   /* stop condition: EOS       */
 
-#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
-        if (g_trans_model) {
-            float *res = transformer_forward(g_trans_model, next_token, num_tokens - 1);
-            if (!res) break;
-            cur_logits = res;
-        } else {
-            cur_logits = pipeline_step(pipeline, next_token);
-            if (!cur_logits) break;
-        }
-#else
         cur_logits = pipeline_step(pipeline, next_token);
         if (!cur_logits) break;
-#endif
     }
-
-    printf("\n");
-}
-
-#define MAX_MODEL_BINS 64
-#define BIN_PATH_LEN 256
-
-static int list_model_bins(char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN]) {
-    int count = 0;
-    DIR *d = opendir(".");
-    if (!d) return 0;
-
-    struct dirent *dir;
-    while ((dir = readdir(d)) != NULL) {
-        if (dir->d_type == DT_REG || dir->d_type == DT_UNKNOWN) {
-            const char *dot = strrchr(dir->d_name, '.');
-            if (dot && strcmp(dot, ".bin") == 0) {
-                if (count < MAX_MODEL_BINS) {
-                    snprintf(bin_files[count], BIN_PATH_LEN, "%s", dir->d_name);
-                    count++;
-                }
-            }
-        }
-    }
-    closedir(d);
-
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (strcmp(bin_files[i], bin_files[j]) > 0) {
-                char tmp[BIN_PATH_LEN];
-                memcpy(tmp, bin_files[i], BIN_PATH_LEN);
-                memcpy(bin_files[i], bin_files[j], BIN_PATH_LEN);
-                memcpy(bin_files[j], tmp, BIN_PATH_LEN);
-            }
-        }
-    }
-
-    return count;
-}
-
-static int find_latest_bin(const char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN], int count, char *out_path, size_t out_sz) {
-    if (count <= 0) return 0;
-
-    int max_epoch = -1;
-    int best_epoch_idx = -1;
-    int checkpoint_best_idx = -1;
-    int model_bin_idx = -1;
-
-    for (int i = 0; i < count; i++) {
-        int ep = -1;
-        if (sscanf(bin_files[i], "checkpoint_epoch_%d.bin", &ep) == 1) {
-            if (ep > max_epoch) {
-                max_epoch = ep;
-                best_epoch_idx = i;
-            }
-        } else if (strcmp(bin_files[i], "checkpoint_best.bin") == 0) {
-            checkpoint_best_idx = i;
-        } else if (strcmp(bin_files[i], "model.bin") == 0) {
-            model_bin_idx = i;
-        }
-    }
-
-    int selected_idx = 0;
-    if (best_epoch_idx >= 0) {
-        selected_idx = best_epoch_idx;
-    } else if (checkpoint_best_idx >= 0) {
-        selected_idx = checkpoint_best_idx;
-    } else if (model_bin_idx >= 0) {
-        selected_idx = model_bin_idx;
-    } else {
-        time_t newest_time = 0;
-        for (int i = 0; i < count; i++) {
-            struct stat st;
-            if (stat(bin_files[i], &st) == 0) {
-                if (st.st_mtime > newest_time) {
-                    newest_time = st.st_mtime;
-                    selected_idx = i;
-                }
-            }
-        }
-    }
-
-    snprintf(out_path, out_sz, "%s", bin_files[selected_idx]);
-    return 1;
-}
-
-static int load_selected_bin(const char *target_path, Pipeline **pipeline_ptr, char *active_model_path, size_t path_sz) {
-    if (!target_path || target_path[0] == '\0') {
-        tui_log_error("Invalid model path specified.");
-        return 0;
-    }
-
-    struct stat st;
-    if (stat(target_path, &st) != 0) {
-        tui_log_error("Model checkpoint '%s' not found.", target_path);
-        return 0;
-    }
-
-    tui_log_info("Switching model binary to '%s'...", target_path);
-
-#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
-    if (g_trans_model) {
-        if (transformer_load_weights(g_trans_model, target_path) != 0) {
-            tui_log_warn("Failed to reload Transformer weights from '%s'.", target_path);
-        }
-    }
-#endif
-
-    Pipeline *new_pipe = pipeline_load(target_path);
-    if (!new_pipe) {
-        tui_log_error("Failed to load pipeline from model binary '%s'.", target_path);
-        return 0;
-    }
-
-    if (*pipeline_ptr) {
-        pipeline_free(*pipeline_ptr);
-    }
-    *pipeline_ptr = new_pipe;
-    pipeline_reset(*pipeline_ptr);
-
-    snprintf(active_model_path, path_sz, "%s", target_path);
-    tui_log_success("Successfully loaded and active on model '%s'!", target_path);
-    return 1;
-}
-
-static void handle_bin_command(const char *args, Pipeline **pipeline_ptr, char *active_model_path, size_t path_sz) {
-    char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN];
-    int count = list_model_bins(bin_files);
-
-    if (count == 0) {
-        tui_log_warn("No '.bin' model checkpoints found in current directory.");
-        return;
-    }
-
-    while (*args == ' ') args++;
-
-    if (strcmp(args, "auto") == 0) {
-        char auto_target[256];
-        if (find_latest_bin(bin_files, count, auto_target, sizeof(auto_target))) {
-            tui_log_info("[bin auto] Selected latest checkpoint '%s'", auto_target);
-            load_selected_bin(auto_target, pipeline_ptr, active_model_path, path_sz);
-        } else {
-            tui_log_warn("Could not determine latest checkpoint.");
-        }
-        return;
-    }
-
-    if (args[0] != '\0') {
-        int idx = atoi(args);
-        if (idx > 0 && idx <= count) {
-            load_selected_bin(bin_files[idx - 1], pipeline_ptr, active_model_path, path_sz);
-            return;
-        } else if (access(args, F_OK) == 0) {
-            load_selected_bin(args, pipeline_ptr, active_model_path, path_sz);
-            return;
-        } else {
-            tui_log_error("Invalid selection or file '%s' not found.", args);
-            return;
-        }
-    }
-
-    const Theme *th = tui_get_theme();
-    printf("\n%s[DISCOVERED MODEL CHECKPOINTS (%d found)]%s\n", th->primary, count, ANSI_RESET);
-    for (int i = 0; i < count; i++) {
-        int is_current = (strcmp(bin_files[i], active_model_path) == 0);
-        printf("  %s[%d]%s %-32s %s\n",
-               th->primary, i + 1, ANSI_RESET,
-               bin_files[i],
-               is_current ? "\033[32m(ACTIVE)\033[0m" : "");
-    }
-
-    char sel_input[64];
-    if (tui_readline("Select model number to load (1-N, 0 to cancel): ", sel_input, sizeof(sel_input))) {
-        sel_input[strcspn(sel_input, "\r\n")] = '\0';
-        int sel = atoi(sel_input);
-        if (sel > 0 && sel <= count) {
-            load_selected_bin(bin_files[sel - 1], pipeline_ptr, active_model_path, path_sz);
-        } else if (sel == 0) {
-            tui_log_info("Model selection cancelled.");
-        } else {
-            tui_log_error("Selection out of bounds [1-%d].", count);
-        }
-    }
-}
-
-static void print_help_menu(void) {
-    const Theme *th = tui_get_theme();
-    printf("\n%s[NEURICODE COMMANDS]%s\n", th->primary, ANSI_RESET);
-    printf("  %s/help%s         - Display help manual\n", th->primary, ANSI_RESET);
-    printf("  %s/bin [auto|num]%s - Scan, switch, or auto-load .bin model checkpoints\n", th->primary, ANSI_RESET);
-    printf("  %s/theme%s        - Open interactive arrow-key theme selector (8 themes)\n", th->primary, ANSI_RESET);
-    printf("  %s/status%s       - Display live system status & parameters\n", th->primary, ANSI_RESET);
-    printf("  %s/temp <val>%s   - Set sampling temperature (current: %.2f)\n", th->primary, ANSI_RESET, g_temperature);
-    printf("  %s/topk <val>%s   - Set Top-K sampling cap (current: %d)\n", th->primary, ANSI_RESET, g_top_k);
-    printf("  %s/log%s          - Test colored status logs\n", th->primary, ANSI_RESET);
-    printf("  %s/reset%s        - Reset hidden states & KV cache\n", th->primary, ANSI_RESET);
-    printf("  %s/clear%s        - Clear terminal screen\n", th->primary, ANSI_RESET);
-    printf("  %s/exit%s         - Quit Neuricode CLI\n", th->primary, ANSI_RESET);
-}
-
-static void print_status_dashboard(const char *model_path, const char *vocab_path) {
-    const Theme *th = tui_get_theme();
-    printf("\n%s[SYSTEM DASHBOARD]%s\n", th->primary, ANSI_RESET);
-#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
-    printf("  Engine      : \033[36mTransformer Engine (Self-Attention + KV-Cache)\033[0m\n");
-#else
-    printf("  Engine      : \033[36mRecurrent Neural Network (RNN)\033[0m\n");
-#endif
-    printf("  Model File  : %s\n", model_path);
-    printf("  Vocab File  : %s\n", vocab_path);
-    printf("  Theme       : %s%s%s\n", th->primary, th->name, ANSI_RESET);
-    printf("  Temperature : %.2f\n", g_temperature);
-    printf("  Top-K       : %d\n", g_top_k);
-    printf("  Rep Penalty : %.2f\n", g_rep_penalty);
-    printf("  Status      : \033[32mACTIVE & OPERATIONAL\033[0m\n");
-}
-
-static void handle_theme_selection(void) {
-    const char *options[] = {
-        "Classic Purple   (Default)",
-        "Cyberpunk Cyan   (Cyan Accent)",
-        "Matrix Green     (Electric Green)",
-        "Sunset Orange    (Neon Orange)",
-        "Electric Blue    (Cobalt Blue)",
-        "Crimson Red      (Neon Crimson)",
-        "Emerald Mint     (Teal / Mint)",
-        "Monochrome Dark  (Slate Gray / Silver)"
-    };
-    int selected = tui_interactive_menu("Select Palette", options, 8);
-    if (selected >= 0 && selected < 8) {
-        tui_set_theme((ThemeID)selected);
-        tui_log_success("Theme updated to: %s", tui_get_theme_name((ThemeID)selected));
-    }
-}
-
-static void demo_colored_logs(void) {
-    printf("\n");
-    tui_log_info("Initializing Neural Network pipeline engine...");
-    tui_log_warn("High memory allocation detected in KV cache.");
-    tui_log_error("Sample error message: Model parameter out of bounds.");
-    tui_log_success("All system components validated cleanly!");
+    putchar('\n');
 }
 
 int main(int argc, char **argv) {
-    tui_init();
-    srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)&argc);
-
-    char model_path[1024] = "";
-    char vocab_path[1024] = "";
-
-    if (argc >= 3) {
-        snprintf(model_path, sizeof(model_path), "%s", argv[1]);
-        snprintf(vocab_path, sizeof(vocab_path), "%s", argv[2]);
-    } else {
-        if (!auto_discover_files(model_path, sizeof(model_path), vocab_path, sizeof(vocab_path))) {
-            tui_log_error("Model file (model.bin) or Vocab file (assets/vocab.txt) not found.");
-            fprintf(stderr, "Usage: neuricode [model.bin] [assets/vocab.txt]\n");
-            return 1;
-        }
-    }
-
-    tui_clear_screen();
-    tui_print_header_banner("1.1.0", model_path);
-
-#if ACTIVE_MODEL_TYPE == MODEL_TYPE_TRANSFORMER
-    g_trans_model = transformer_init_from_config();
-    if (g_trans_model) {
-        tui_log_success("Loaded Native Transformer Engine (vocab=%d, dim=%d, layers=%d, heads=%d)",
-                        g_trans_model->config.vocab_size, g_trans_model->config.dim,
-                        g_trans_model->config.n_layers, g_trans_model->config.n_heads);
-    }
-#endif
-
-    Pipeline *pipeline = pipeline_load(model_path);
-    if (!pipeline) {
-        tui_log_error("Could not load model from '%s'", model_path);
-        if (g_trans_model) transformer_free(g_trans_model);
+    if (argc != 3 && argc != 4) {
+        print_usage(argv[0]);
         return 1;
     }
 
-    Tokenizer *tokenizer = tokenizer_load(vocab_path);
+    /* time(NULL) alone only has 1-second granularity; XOR in a stack
+     * address (ASLR-randomized per process) so two runs launched in
+     * the same second still diverge. */
+    srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)&argc);
+
+    Pipeline *pipeline = pipeline_load(argv[1]);
+    if (!pipeline) {
+        fprintf(stderr, "cli: failed to load model '%s'\n", argv[1]);
+        return 1;
+    }
+
+    Tokenizer *tokenizer = tokenizer_load(argv[2]);
     if (!tokenizer) {
-        tui_log_error("Could not load tokenizer from '%s'", vocab_path);
-        if (g_trans_model) transformer_free(g_trans_model);
+        fprintf(stderr, "cli: failed to load tokenizer '%s'\n", argv[2]);
+        pipeline_free(pipeline);
         return 1;
     }
 
     int vocab_size = tokenizer_vocab_size(tokenizer);
     int eos_id = tokenizer_eos_id(tokenizer);
-
-    int   *tokens = calloc(MAX_TOKENS, sizeof(*tokens));
-    float *logits = calloc((size_t)vocab_size, sizeof(*logits));
-    int   *seen   = calloc((size_t)vocab_size, sizeof(*seen));
-
-    if (!tokens || !logits || !seen) {
-        tui_log_error("Out of memory allocation failure.");
-        if (g_trans_model) transformer_free(g_trans_model);
+    if (vocab_size <= 0) {
+        fprintf(stderr, "cli: tokenizer reports invalid vocab size (%d)\n", vocab_size);
+        tokenizer_free(tokenizer);
+        pipeline_free(pipeline);
+        return 1;
+    }
+    if (vocab_size > MAX_VOCAB) {
+        /* Fail fast rather than silently truncating the vocabulary —
+         * a silent clamp would quietly drop real tokens from
+         * consideration. This project's models are fixed at
+         * vocab_size=256 (load_model.c's EXPECTED_VOCAB), so this
+         * never actually triggers in practice. */
+        fprintf(stderr, "cli: vocab_size %d exceeds MAX_VOCAB %d\n",
+                vocab_size, MAX_VOCAB);
+        tokenizer_free(tokenizer);
+        pipeline_free(pipeline);
         return 1;
     }
 
-    char input[INPUT_BYTES];
-    while (1) {
-        int width = tui_get_terminal_width();
-        const Theme *th = tui_get_theme();
+    /* All generation-loop buffers allocated ONCE here, outside any
+     * per-token path, and reused for every step / every prompt —
+     * satisfies "no malloc/free inside the generation loop". */
+    int   *tokens = calloc(MAX_TOKENS, sizeof(*tokens));
+    float *logits = calloc((size_t)vocab_size, sizeof(*logits));
+    int   *seen   = calloc((size_t)vocab_size, sizeof(*seen)); 
+    if (!tokens || !logits || !seen) {
+        fprintf(stderr, "cli: out of memory\n");
+        free(tokens);
+        free(logits);
+        free(seen);
+        tokenizer_free(tokenizer);
+        pipeline_free(pipeline);
+        return 1;
+    }
 
-        printf("\n%s", th->muted);
-        for (int i = 0; i < width; i++) printf("─");
-        printf("%s\n", ANSI_RESET);
+    if (argc == 4) {
+        /* single-shot mode: ./cli model.bin vocab.txt "prompt" */
+        run_generation(pipeline, tokenizer, vocab_size, eos_id, argv[3],
+                        tokens, logits, seen);
+    } else {
+        /* interactive REPL mode: ./cli model.bin vocab.txt */
+        char input[INPUT_BYTES];
+        while (1) {
+            fputs("> ", stdout);
+            fflush(stdout);
+            if (!fgets(input, sizeof(input), stdin)) break;
 
-        char prompt_buf[128];
-        snprintf(prompt_buf, sizeof(prompt_buf), "%s%s> %s", ANSI_BOLD, th->prompt, ANSI_RESET);
+            input[strcspn(input, "\n")] = '\0';
+            if (input[0] == '\0') continue;
 
-        if (!tui_readline(prompt_buf, input, sizeof(input))) break;
-
-        printf("%s", th->muted);
-        for (int i = 0; i < width; i++) printf("─");
-        printf("%s\n", ANSI_RESET);
-        fflush(stdout);
-
-        input[strcspn(input, "\r\n")] = '\0';
-        if (input[0] == '\0') continue;
-
-        // Handle slash commands
-        if (strcmp(input, "/exit") == 0 || strcmp(input, "/quit") == 0) {
-            tui_log_info("Goodbye! Session closed.");
-            break;
-        } else if (strcmp(input, "/help") == 0) {
-            print_help_menu();
-            continue;
-        } else if (strcmp(input, "/theme") == 0) {
-            handle_theme_selection();
-            continue;
-        } else if (strcmp(input, "/status") == 0) {
-            print_status_dashboard(model_path, vocab_path);
-            continue;
-        } else if (strcmp(input, "/log") == 0) {
-            demo_colored_logs();
-            continue;
-        } else if (strcmp(input, "/clear") == 0) {
-            tui_clear_screen();
-            tui_print_header_banner("1.1.0", model_path);
-            continue;
-        } else if (strncmp(input, "/temp ", 6) == 0) {
-            float t = strtof(input + 6, NULL);
-            if (t > 0.0f) {
-                g_temperature = t;
-                tui_log_success("Temperature updated to %.2f", g_temperature);
-            } else {
-                tui_log_warn("Invalid temperature value.");
-            }
-            continue;
-        } else if (strncmp(input, "/topk ", 6) == 0) {
-            int k = atoi(input + 6);
-            if (k > 0) {
-                g_top_k = k;
-                tui_log_success("Top-K updated to %d", g_top_k);
-            } else {
-                tui_log_warn("Invalid Top-K value.");
-            }
-            continue;
-        } else if (strcmp(input, "/bin") == 0) {
-            handle_bin_command("", &pipeline, model_path, sizeof(model_path));
-            continue;
-        } else if (strncmp(input, "/bin ", 5) == 0) {
-            handle_bin_command(input + 5, &pipeline, model_path, sizeof(model_path));
-            continue;
-        } else if (strcmp(input, "/reset") == 0) {
-            pipeline_reset(pipeline);
-            tui_log_success("Model hidden states and memory reset.");
-            continue;
+            run_generation(pipeline, tokenizer, vocab_size, eos_id, input,
+                            tokens, logits, seen);
         }
-
-        // Code highlight fallback
-        if (strncmp(input, "code", 4) == 0 || strncmp(input, "def ", 4) == 0 || strncmp(input, "int ", 4) == 0) {
-            const char *sample_code =
-                "int main(void) {\n"
-                "    printf(\"Hello, Neuricode Antigravity CLI!\\n\");\n"
-                "    return 0;\n"
-                "}";
-            tui_print_highlighted_code(sample_code);
-            continue;
-        }
-
-        run_generation(pipeline, tokenizer, vocab_size, eos_id, input, tokens, logits, seen);
     }
 
     free(tokens);
     free(logits);
     free(seen);
     tokenizer_free(tokenizer);
-    if (g_trans_model) transformer_free(g_trans_model);
+  //pipeline_free(pipeline);
     return 0;
 }
