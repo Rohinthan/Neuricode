@@ -29,7 +29,6 @@ typedef enum {
 typedef struct {
     const char *name;
     const char *primary;     // Main accent color
-    const char *secondary;   // Secondary accent
     const char *prompt;      // Prompt cursor color
     const char *text;        // Body text
     const char *muted;       // Divider line color
@@ -38,6 +37,8 @@ typedef struct {
 const Theme *tui_get_theme(void);
 void tui_set_theme(ThemeID id);
 const char *tui_get_theme_name(ThemeID id);
+void tui_load_theme_config(void);
+void tui_save_theme_config(ThemeID id);
 
 // ANSI Escape Codes
 #define ANSI_RESET        "\033[0m"
@@ -67,6 +68,9 @@ void tui_disable_raw_mode(void);
 
 // Header Banner & Straight Lines
 void tui_print_header_banner(const char *version, const char *model_name);
+
+// Interactive Line Input with History (Up/Down arrow keys)
+bool tui_readline(const char *prompt_prefix, char *out_buf, size_t max_len);
 
 // Straight Input Divider Lines
 void tui_print_antigravity_input_frame_start(void);
