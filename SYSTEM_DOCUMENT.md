@@ -247,7 +247,7 @@ Neuricode includes a lightweight terminal REPL shell:
 
 ```
    ┌──────────────────────────────────────────────────────────┐
-   │ ⚡ NEURICODE v1 — Native Zero-Dependency Edge AI Engine │
+   │  NEURICODE  — Native Zero-Dependency Edge AI Engine │
    │ Model: model.bin | Vocab: assets/vocab.txt | GPU: CUDA  │
    └──────────────────────────────────────────────────────────┘
 ```
@@ -428,21 +428,6 @@ The complete data pipeline transforms raw unstructured text into tokenized integ
 +-----------------------------------------------------------------------------+
 ```
 
----
-
-### 1.3 Comparative Analysis: Neuricode vs. Standard Deep Learning Frameworks
-
-| Feature / Dimension | ⚡ **Neuricode v1** | 🐍 **PyTorch / TensorFlow** | 🦙 **llama.cpp / GGML** | 📦 **ONNX Runtime** |
-|---|---|---|---|---|
-| **Language Stack** | **100% ISO C11** | Python + C++ / CUDA | C++11 / C++17 | C++17 |
-| **Dependencies** | **0 (Zero / Standard C)** | Heavy (Python, MKL, libtorch, CUDA) | Low (C++ STL, pthread, OpenMP) | Medium (Protobuf, Abseil, Flatbuffers) |
-| **Binary Size** | **~4.4 MB** | > 2.0 – 5.0 GB | ~15 – 30 MB | ~50 – 100 MB |
-| **Cold Start Boot** | **< 2 milliseconds** | 1.5 – 5.0 seconds | 50 – 200 milliseconds | 200 – 500 milliseconds |
-| **Terminal UI Engine** | **Built-in ANSI TUI + `menuconfig`** | None (requires Python UI) | Basic CLI prompt | None (library only) |
-| **Embedded Edge Ready** | **Raspberry Pi, Jetson, MCU** | No (requires heavy OS + Python) | Yes (Inference only) | Partial (requires C++ runtime) |
-| **Native C Training** | **Full Autograd & Backprop** | Full (Python API) | Limited / Inference Focused | Limited / Export Focused |
-
----
 
 ## SECTION 2: EXECUTION FLOW (STEP-BY-STEP)
 
