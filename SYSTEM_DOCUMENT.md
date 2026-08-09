@@ -6,6 +6,17 @@
 
 ### 1.1 High-Level Architectural Paradigm
 Neuricode is a production-grade, zero-external-dependency deep learning framework and LLM engine built in pure ISO C11 with an accelerated CUDA C++/cuBLAS compute backend. The system is engineered around six core technical pillars:
+Skip to contributions year list
+Contribution Graph
+Day of Week 	August Aug 	September Sep 	October Oct 	November Nov 	December Dec 	January Jan 	February Feb 	March Mar 	April Apr 	May May 	June Jun 	July Jul 	August Aug
+Sunday Sun 																																																					
+Monday Mon 																																																					
+Tuesday Tue 																																																					
+Wednesday Wed 																																																					
+Thursday Thu 																																																					
+Friday Fri 																																																					
+Saturday Sat 																																																					
+
 
 1. **Explicit Memory Control & Cache Alignment**: Zero implicit heap allocations during active forward/backward passes. Memory required for activations, gradients, scratchpads, and velocity state buffers is pre-allocated and aligned to 64-byte boundaries (`neuralc_aligned_alloc`) to optimize SIMD vector loads (AVX2/AVX-512) and DMA transfer efficiency. Includes an optional memory arena allocator (`memory/memory.c`).
 2. **Unified Dual-Backend Device Abstraction**: Tensors carry explicit device placement tags (`CF_GPU_NONE`, `CF_GPU_CUDA`, `CF_GPU_OPENCL`). High-level neural network operations (Dense, Conv2D, RNN, Transformer, Loss Functions) dynamically query tensor placement and dispatch execution either to CPU SIMD micro-kernels or to asynchronous CUDA kernel streams.
