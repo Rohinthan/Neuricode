@@ -150,6 +150,10 @@ Inside `neuricode`, use `/` commands to control execution:
 
 ---
 
+Core neural network library in C – foundation for a larger AI system
+NeuralC (my implementation):
+https://github.com/Rohinthan/neuralc
+
 ## 📜 License
 
 Distributed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
