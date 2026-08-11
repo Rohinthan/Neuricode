@@ -332,17 +332,26 @@ static int find_latest_bin(const char bin_files[MAX_MODEL_BINS][BIN_PATH_LEN], i
     int max_epoch = -1;
     int best_epoch_idx = -1;
     int checkpoint_best_idx = -1;
+    int max_best_num = -1;
     int model_bin_idx = -1;
 
     for (int i = 0; i < count; i++) {
         int ep = -1;
+        int best_num = -1;
         if (sscanf(bin_files[i], "checkpoint_epoch_%d.bin", &ep) == 1) {
             if (ep > max_epoch) {
                 max_epoch = ep;
                 best_epoch_idx = i;
             }
+        } else if (sscanf(bin_files[i], "checkpoint_best_%d.bin", &best_num) == 1) {
+            if (best_num > max_best_num) {
+                max_best_num = best_num;
+                checkpoint_best_idx = i;
+            }
         } else if (strcmp(bin_files[i], "checkpoint_best.bin") == 0) {
-            checkpoint_best_idx = i;
+            if (checkpoint_best_idx < 0) {
+                checkpoint_best_idx = i;
+            }
         } else if (strcmp(bin_files[i], "model.bin") == 0) {
             model_bin_idx = i;
         }
