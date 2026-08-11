@@ -172,20 +172,26 @@ static int save_model(const char *path, const RNNLayer *rnn,
     return ok ? 0 : -1;
 }
 
-static void save_checkpoint(const RNNLayer *rnn, const DenseLayer *out_layer,
-                            int vocab_size, int hidden_size, int epoch) {
-    char ckpt_path[1024];
-    snprintf(ckpt_path, sizeof(ckpt_path), "checkpoint_epoch_%d.bin", epoch);
-    if (save_model(ckpt_path, rnn, out_layer, vocab_size, hidden_size) == 0) {
-        printf("[checkpoint] Saved epoch snapshot -> '%s'\n", ckpt_path);
-    } else {
-        fprintf(stderr, "[checkpoint] Error: failed to save epoch checkpoint '%s'\n", ckpt_path);
+static void get_best_checkpoint_path(char *out_path, size_t out_sz) {
+    if (access("checkpoint_best.bin", F_OK) != 0) {
+        snprintf(out_path, out_sz, "checkpoint_best.bin");
+        return;
+    }
+    int idx = 2;
+    while (1) {
+        char test_path[1024];
+        snprintf(test_path, sizeof(test_path), "checkpoint_best_%d.bin", idx);
+        if (access(test_path, F_OK) != 0) {
+            snprintf(out_path, out_sz, "%s", test_path);
+            return;
+        }
+        idx++;
     }
 }
 
 static void save_best_checkpoint(const RNNLayer *rnn, const DenseLayer *out_layer,
-                                 int vocab_size, int hidden_size, float loss) {
-    const char *best_path = "checkpoint_best.bin";
+                                 int vocab_size, int hidden_size, float loss,
+                                 const char *best_path) {
     if (save_model(best_path, rnn, out_layer, vocab_size, hidden_size) == 0) {
         printf("[checkpoint] New best model saved (loss: %.4f) -> '%s'\n", loss, best_path);
     } else {
@@ -556,6 +562,10 @@ int main(int argc, char **argv) {
         printf("[train] %d steps/epoch, %d epochs, batch_size=%d, seq_len=%d\n",
                steps_per_epoch, config.epochs, config.batch_size, config.seq_len);
 
+        char best_ckpt_path[1024];
+        get_best_checkpoint_path(best_ckpt_path, sizeof(best_ckpt_path));
+        printf("[checkpoint] Best model checkpoint target set to '%s'\n", best_ckpt_path);
+
         float prev_loss = 1e9f;
         float best_loss = 1e9f;
         int plateau_count = 0;
@@ -613,16 +623,13 @@ int main(int argc, char **argv) {
             prev_loss = avg_loss;
             printf("Epoch %d | Loss: %.4f\n", epoch + 1, avg_loss);
 
-            /* Save epoch historical snapshot: checkpoint_epoch_<N>.bin */
-            save_checkpoint(rnn, dense, vocab_size, config.hidden_size, epoch + 1);
-
             /* Always update latest model checkpoint: model.bin */
             save_model(model_path, rnn, dense, vocab_size, config.hidden_size);
 
             /* Track and save best model if loss improved */
             if (avg_loss < best_loss) {
                 best_loss = avg_loss;
-                save_best_checkpoint(rnn, dense, vocab_size, config.hidden_size, avg_loss);
+                save_best_checkpoint(rnn, dense, vocab_size, config.hidden_size, avg_loss, best_ckpt_path);
             }
         }
     }
