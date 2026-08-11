@@ -48,7 +48,7 @@ const float *pipeline_step(Pipeline *model, int token_id) {
 
     Tensor *rnn_2d = tensor_reshape(model->rnn_out, dense_shape, 2);
     dense_forward(model->out, rnn_2d, model->dense_out);
-//    tensor_free(rnn_2d); if root case to make core dumb:
+    tensor_free(rnn_2d);
     return model->dense_out->data;
 }
 
@@ -119,18 +119,9 @@ void pipeline_forward(Pipeline *model, const int *input, int seq_len, float *out
         const float *logits = pipeline_step(model, input[i]);
         if (!logits) return; /* pipeline_step already logged the reason */
 
-        if (i == seq_len - 1){
-            size_t vs = (size_t)model->vocab_size;
-
-            //TEMP debug limit
-            size_t safe = vs;
-
-            //if you know max tensor size, clean it
-            if (safe > 1024) safe = 1024; 
-
-            memcpy(output, logits, safe * sizeof(float));
+        if (i == seq_len - 1) {
+            memcpy(output, logits, (size_t)model->vocab_size * sizeof(float));
         }
-        //memcpy(output, logits, (size_t)model->vocab_size * sizeof(float));
     }
 }
 
