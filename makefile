@@ -71,7 +71,7 @@ OBJ_CFG  = $(patsubst config/%.c, build/%.o, $(SRC_CFG))
 OBJ_MEM  = $(patsubst memory/%.c, build/%.o, $(SRC_MEM))
 # GPU_OBJS (cuda_backend.o / opencl_backend.o) is populated above,
 # per whatever NEURALC_GPU_BACKEND says — empty when GPU is Off.
-OBJ      = $(OBJ_CORE) $(OBJ_CFG) $(OBJ_MEM) $(GPU_OBJS)
+OBJ      = $(OBJ_CORE) $(OBJ_CFG) $(OBJ_MEM) build/cuda_backend.o
 
 .PHONY: all demo rnn_demo mnist_demo demo_mnist cnn_mnist demo_char_rnn \
         demo_char_rnn_asan config clean libneuralc omp test neuricode install
@@ -136,6 +136,9 @@ test_transformer: tools/test_transformer.c $(OBJ)
 
 benchmark_suite: tools/benchmark_suite.c $(OBJ)
 	$(CC) $(CFLAGS) -o benchmark_suite tools/benchmark_suite.c $(OBJ) $(LDFLAGS) $(GPU_LDFLAGS)
+
+cuda_test_suite: tools/cuda_test_suite.c $(OBJ)
+	$(CC) $(CFLAGS) -o cuda_test_suite tools/cuda_test_suite.c $(OBJ) $(LDFLAGS) $(GPU_LDFLAGS)
 
 # ── debug/ASan build ────────────────────────────────────────────────
 # Separate from the normal demo_char_rnn target above: compiles every
@@ -219,8 +222,12 @@ build/%.o: apps/%.c $(CONFIG_DEP)
 # Only built when NEURALC_GPU_BACKEND selects them (see auto-config
 # block above) — these explicit rules take precedence over the
 # generic src/%.c / src/%.cu pattern since there is none for .cu.
-build/cuda_backend.o: cuda/src/cuda_backend.cu cuda/include/cuda_backend.h
-	$(NVCC) -O3 -Xcompiler -fPIC -I cuda/include -I include/ -c cuda/src/cuda_backend.cu -o build/cuda_backend.o
+build/cuda_backend.o: cuda/src/cuda_backend.cu cuda/src/cuda_stub.c cuda/include/cuda_backend.h
+ifeq ($(NEURALC_USE_GPU),1)
+	$(NVCC) -O3 -DUSE_CUDA -Xcompiler -fPIC -I cuda/include -I include/ -c cuda/src/cuda_backend.cu -o build/cuda_backend.o
+else
+	$(CC) $(CFLAGS) -I cuda/include -I include/ -c cuda/src/cuda_stub.c -o build/cuda_backend.o
+endif
 
 build/opencl_backend.o: src/gpu/opencl_backend.c include/gpu/opencl_backend.h
 	$(CC) $(CFLAGS) -c src/gpu/opencl_backend.c -o build/opencl_backend.o
