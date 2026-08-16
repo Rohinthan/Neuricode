@@ -85,6 +85,34 @@ typedef struct {
     float *sin;         // Precomputed sin: [seq_len, head_size / 2]
 } RoPETable;
 
+// Block Q8_0 Quantization Representation (Block Size = 32)
+#define Q8_0_BLOCK_SIZE 32
+
+typedef struct {
+    float scale;
+    int8_t qs[Q8_0_BLOCK_SIZE];
+} BlockQ8_0;
+
+// Block Q4_0 Quantization Representation (Block Size = 32)
+#define Q4_0_BLOCK_SIZE 32
+
+typedef struct {
+    float scale;
+    uint8_t qs[16];
+} BlockQ4_0;
+
+typedef struct {
+    BlockQ8_0 *wq;   // Quantized Wq [n_layers * dim * dim / 32]
+    BlockQ8_0 *wk;   // Quantized Wk [n_layers * dim * dim / 32]
+    BlockQ8_0 *wv;   // Quantized Wv [n_layers * dim * dim / 32]
+    BlockQ8_0 *wo;   // Quantized Wo [n_layers * dim * dim / 32]
+    BlockQ8_0 *w1;   // Quantized W1 [n_layers * hidden_dim * dim / 32]
+    BlockQ8_0 *w2;   // Quantized W2 [n_layers * dim * hidden_dim / 32]
+    BlockQ8_0 *w3;   // Quantized W3 [n_layers * hidden_dim * dim / 32]
+    BlockQ4_0 *wcls; // Quantized Wcls (Q4_0) [vocab_size * dim / 32]
+    bool is_quantized;
+} QuantizedTransformerWeights;
+
 // Quantized INT8 Weight Representation (Q8_0)
 typedef struct {
     int8_t *qweights;   // Quantized signed int8 weights
@@ -96,6 +124,7 @@ typedef struct {
 typedef struct {
     TransformerConfig config;
     TransformerWeights weights;
+    QuantizedTransformerWeights qweights;
     TransformerState state;
     RoPETable rope;
     bool debug_mode;
@@ -122,5 +151,14 @@ bool validate_tensor_buffer(const float *data, size_t size, const char *name);
 QuantizedWeightQ8 *quantize_weight_q8(const float *src, size_t rows, size_t cols);
 void free_quantized_weight_q8(QuantizedWeightQ8 *qw);
 void matmul_q8(float *xout, const float *x, const QuantizedWeightQ8 *qw, int n, int d);
+
+// Production Block Q8_0 API
+void transformer_quantize_weights(TransformerModel *model);
+void free_quantized_transformer_weights(QuantizedTransformerWeights *qw);
+void matmul_q8_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d);
+void matmul_q8_fused_w1w3_avx2(float *xout_w1, float *xout_w3, const float *x, const BlockQ8_0 *qw1, const BlockQ8_0 *qw3, int n, int d);
+void matmul_q8_lm_head_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d);
+void matmul_q8_w2_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d);
+void matmul_q4_0_wcls_avx2(float *xout, const float *x, const BlockQ4_0 *qw, int n, int d);
 
 #endif // NEURICODE_TRANSFORMER_H
