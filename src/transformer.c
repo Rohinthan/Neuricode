@@ -1084,6 +1084,9 @@ TransformerModel *transformer_init(TransformerConfig config) {
         return NULL;
     }
 
+    // Automatically quantize eligible linear projections into Block Q8_0 once during init
+    transformer_quantize_weights(model);
+
     return model;
 }
 
@@ -1100,6 +1103,8 @@ TransformerModel *transformer_init_from_config(void) {
 
 void transformer_free(TransformerModel *model) {
     if (!model) return;
+
+    free_quantized_transformer_weights(&model->qweights);
 
     TransformerWeights *w = &model->weights;
     neuralc_aligned_free(w->token_embedding_table);
@@ -1164,15 +1169,26 @@ float *transformer_forward(TransformerModel *model, int token, int pos) {
     const float *emb_row = w->token_embedding_table + (size_t)token * dim;
     memcpy(s->x, emb_row, dim * sizeof(float));
 
+    // Workload-Aware GEMV Dispatcher (Q8_0 for memory-bound matrices >= 589824 elements [2.25MB FP32], FP32 AVX2 otherwise)
+    #define MATMUL_DISPATCH(xout, x, w_fp32, w_q8_base, offset_elements, n, d) \
+        do { \
+            const BlockQ8_0 *q8_ptr = (w_q8_base) ? (w_q8_base) + (size_t)(offset_elements) / Q8_0_BLOCK_SIZE : NULL; \
+            if (q8_ptr && (size_t)(n) * (d) >= 589824) { \
+                matmul_q8_avx2((xout), (x), q8_ptr, (n), (d)); \
+            } else { \
+                matmul((xout), (x), (w_fp32), (n), (d)); \
+            } \
+        } while (0)
+
     // Step 2: Forward pass through Transformer layers
     for (int l = 0; l < cfg->n_layers; l++) {
         // RMSNorm before self-attention
         rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim);
 
         // Q, K, V Projections
-        matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + (size_t)l * dim * dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + (size_t)l * dim * dim, dim, dim);
+        MATMUL_DISPATCH(s->q, s->xb, w->wq + (size_t)l * dim * dim, model->qweights.wq, (size_t)l * dim * dim, dim, dim);
+        MATMUL_DISPATCH(s->k, s->xb, w->wk + (size_t)l * dim * dim, model->qweights.wk, (size_t)l * dim * dim, dim, dim);
+        MATMUL_DISPATCH(s->v, s->xb, w->wv + (size_t)l * dim * dim, model->qweights.wv, (size_t)l * dim * dim, dim, dim);
 
         // Apply fast RoPE using precomputed lookup table
         apply_rope_fast(s->q, s->k, pos, head_size, n_heads, &model->rope);
@@ -1223,7 +1239,7 @@ float *transformer_forward(TransformerModel *model, int token, int pos) {
         }
 
         // Out projection Wo
-        matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
+        MATMUL_DISPATCH(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, model->qweights.wo, (size_t)l * dim * dim, dim, dim);
 
         // Residual connection
         for (int i = 0; i < dim; i++) {
@@ -1234,8 +1250,17 @@ float *transformer_forward(TransformerModel *model, int token, int pos) {
         rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim);
 
         // SwiGLU Feed-Forward Network: w2 * (SiLU(w1 * x) * (w3 * x))
-        matmul(s->hb,  s->xb, w->w1 + (size_t)l * hidden_dim * dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + (size_t)l * hidden_dim * dim, dim, hidden_dim);
+        if (model->qweights.w1 && model->qweights.w3 && ((size_t)dim * hidden_dim >= 589824)) {
+            matmul_q8_fused_w1w3_avx2(
+                s->hb, s->hb2, s->xb,
+                model->qweights.w1 + (size_t)l * hidden_dim * dim / Q8_0_BLOCK_SIZE,
+                model->qweights.w3 + (size_t)l * hidden_dim * dim / Q8_0_BLOCK_SIZE,
+                dim, hidden_dim
+            );
+        } else {
+            MATMUL_DISPATCH(s->hb,  s->xb, w->w1 + (size_t)l * hidden_dim * dim, model->qweights.w1, (size_t)l * hidden_dim * dim, dim, hidden_dim);
+            MATMUL_DISPATCH(s->hb2, s->xb, w->w3 + (size_t)l * hidden_dim * dim, model->qweights.w3, (size_t)l * hidden_dim * dim, dim, hidden_dim);
+        }
 
         // Same #pragma omp parallel for schedule(static) as before -- the
         // only change is what each thread does with its chunk: AVX2
@@ -1280,7 +1305,11 @@ float *transformer_forward(TransformerModel *model, int token, int pos) {
         }
 #endif
 
-        matmul(s->xb2, s->hb, w->w2 + (size_t)l * dim * hidden_dim, hidden_dim, dim);
+        if (model->qweights.w2 && ((size_t)hidden_dim * dim >= 589824)) {
+            matmul_q8_w2_avx2(s->xb2, s->hb, model->qweights.w2 + (size_t)l * hidden_dim * dim / Q8_0_BLOCK_SIZE, hidden_dim, dim);
+        } else {
+            MATMUL_DISPATCH(s->xb2, s->hb, w->w2 + (size_t)l * dim * hidden_dim, model->qweights.w2, (size_t)l * dim * hidden_dim, hidden_dim, dim);
+        }
 
         // Residual connection
         for (int i = 0; i < dim; i++) {
@@ -1290,7 +1319,11 @@ float *transformer_forward(TransformerModel *model, int token, int pos) {
 
     // Step 3: Final RMSNorm and Classifier (Logits)
     rmsnorm(s->x, s->x, w->rms_final_weight, dim);
-    matmul(s->logits, s->x, w->wcls, dim, cfg->vocab_size);
+    if (model->qweights.wcls && ((size_t)dim * cfg->vocab_size >= 589824)) {
+        matmul_q4_0_wcls_avx2(s->logits, s->x, model->qweights.wcls, dim, cfg->vocab_size);
+    } else {
+        MATMUL_DISPATCH(s->logits, s->x, w->wcls, NULL, 0, dim, cfg->vocab_size);
+    }
 
     if (model->debug_mode) {
         validate_tensor_buffer(s->logits, cfg->vocab_size, "output_logits");
@@ -1456,5 +1489,573 @@ void matmul_q8(float *xout, const float *x, const QuantizedWeightQ8 *qw, int n, 
             acc += (int32_t)w_row[j] * (int32_t)roundf(x[j] * 127.0f);
         }
         xout[i] = ((float)acc * scale) / 127.0f;
+    }
+}
+
+// ── Production Block Q8_0 Implementation (Block Size = 32) ───────────────────
+
+static BlockQ8_0 *quantize_fp32_matrix_to_q8_0_blocks(const float *src, int n, int d) {
+    if (!src || n <= 0 || d <= 0 || (n % Q8_0_BLOCK_SIZE != 0)) return NULL;
+
+    int blocks_per_row = n / Q8_0_BLOCK_SIZE;
+    size_t total_blocks = (size_t)d * blocks_per_row;
+
+    BlockQ8_0 *qblocks = (BlockQ8_0 *)neuralc_aligned_alloc(64, total_blocks * sizeof(BlockQ8_0));
+    if (!qblocks) return NULL;
+
+    for (int j = 0; j < d; j++) {
+        const float *row_fp32 = src + (size_t)j * n;
+        BlockQ8_0 *row_q8 = qblocks + (size_t)j * blocks_per_row;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const float *block_fp32 = row_fp32 + b * Q8_0_BLOCK_SIZE;
+            BlockQ8_0 *block = &row_q8[b];
+
+            float max_val = 0.0f;
+            for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
+                float abs_v = fabsf(block_fp32[i]);
+                if (abs_v > max_val) max_val = abs_v;
+            }
+
+            float scale = max_val / 127.0f;
+            block->scale = scale;
+
+            float idscale = (scale > 1e-10f) ? (127.0f / max_val) : 0.0f;
+
+            for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
+                float qv = block_fp32[i] * idscale;
+                int val = (int)roundf(qv);
+                if (val > 127) val = 127;
+                if (val < -128) val = -128;
+                block->qs[i] = (int8_t)val;
+            }
+        }
+    }
+
+    return qblocks;
+}
+
+static BlockQ4_0 *quantize_fp32_matrix_to_q4_0_blocks(const float *w, int K, int N) {
+    if (!w || K <= 0 || N <= 0 || (K % Q4_0_BLOCK_SIZE != 0)) return NULL;
+
+    int blocks_per_row = K / Q4_0_BLOCK_SIZE;
+    size_t total_blocks = (size_t)N * blocks_per_row;
+
+    BlockQ4_0 *qblocks = (BlockQ4_0 *)neuralc_aligned_alloc(64, total_blocks * sizeof(BlockQ4_0));
+    if (!qblocks) return NULL;
+
+    for (int j = 0; j < N; j++) {
+        const float *row_fp32 = w + (size_t)j * K;
+        BlockQ4_0 *row_q4 = qblocks + (size_t)j * blocks_per_row;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const float *block_fp32 = row_fp32 + b * Q4_0_BLOCK_SIZE;
+            BlockQ4_0 *block = &row_q4[b];
+
+            float max_val = 0.0f;
+            for (int i = 0; i < Q4_0_BLOCK_SIZE; i++) {
+                float abs_v = fabsf(block_fp32[i]);
+                if (abs_v > max_val) max_val = abs_v;
+            }
+
+            float scale = max_val / 7.0f;
+            block->scale = scale;
+            float idscale = (scale > 1e-10f) ? (7.0f / max_val) : 0.0f;
+
+            for (int i = 0; i < 16; i++) {
+                float qv0 = block_fp32[i * 2 + 0] * idscale;
+                float qv1 = block_fp32[i * 2 + 1] * idscale;
+
+                int v0 = (int)roundf(qv0);
+                int v1 = (int)roundf(qv1);
+
+                if (v0 > 7) v0 = 7;
+                if (v0 < -8) v0 = -8;
+                if (v1 > 7) v1 = 7;
+                if (v1 < -8) v1 = -8;
+
+                uint8_t n0 = (uint8_t)(v0 + 8) & 0x0F;
+                uint8_t n1 = (uint8_t)(v1 + 8) & 0x0F;
+
+                block->qs[i] = n0 | (n1 << 4);
+            }
+        }
+    }
+
+    return qblocks;
+}
+
+void free_quantized_transformer_weights(QuantizedTransformerWeights *qw) {
+    if (!qw) return;
+    if (qw->wq) neuralc_aligned_free(qw->wq);
+    if (qw->wk) neuralc_aligned_free(qw->wk);
+    if (qw->wv) neuralc_aligned_free(qw->wv);
+    if (qw->wo) neuralc_aligned_free(qw->wo);
+    if (qw->w1) neuralc_aligned_free(qw->w1);
+    if (qw->w2) neuralc_aligned_free(qw->w2);
+    if (qw->w3) neuralc_aligned_free(qw->w3);
+    if (qw->wcls) neuralc_aligned_free(qw->wcls);
+    memset(qw, 0, sizeof(QuantizedTransformerWeights));
+}
+
+void transformer_quantize_weights(TransformerModel *model) {
+    if (!model) return;
+    TransformerConfig *cfg = &model->config;
+    TransformerWeights *w = &model->weights;
+    QuantizedTransformerWeights *qw = &model->qweights;
+
+    free_quantized_transformer_weights(qw);
+
+    int dim = cfg->dim;
+    int hidden_dim = cfg->hidden_dim;
+    int n_layers = cfg->n_layers;
+    int vocab_size = cfg->vocab_size;
+
+    // Threshold: Quantize matrices where (n * d) >= 589824 elements (>= 2.25 MB FP32, e.g. 768x768)
+    size_t q_thresh = 589824;
+
+    if ((size_t)dim * dim * n_layers >= q_thresh) {
+        qw->wq = quantize_fp32_matrix_to_q8_0_blocks(w->wq, dim, dim * n_layers);
+        qw->wk = quantize_fp32_matrix_to_q8_0_blocks(w->wk, dim, dim * n_layers);
+        qw->wv = quantize_fp32_matrix_to_q8_0_blocks(w->wv, dim, dim * n_layers);
+        qw->wo = quantize_fp32_matrix_to_q8_0_blocks(w->wo, dim, dim * n_layers);
+    }
+
+    if ((size_t)dim * hidden_dim * n_layers >= q_thresh) {
+        qw->w1 = quantize_fp32_matrix_to_q8_0_blocks(w->w1, dim, hidden_dim * n_layers);
+        qw->w3 = quantize_fp32_matrix_to_q8_0_blocks(w->w3, dim, hidden_dim * n_layers);
+    }
+
+    if ((size_t)hidden_dim * dim * n_layers >= q_thresh) {
+        qw->w2 = quantize_fp32_matrix_to_q8_0_blocks(w->w2, hidden_dim, dim * n_layers);
+    }
+
+    if ((size_t)dim * vocab_size >= q_thresh) {
+        qw->wcls = quantize_fp32_matrix_to_q4_0_blocks(w->wcls, dim, vocab_size);
+    }
+
+    qw->is_quantized = true;
+}
+
+NC_AVX2_TARGET void matmul_q8_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d) {
+    NC_ASSERT(xout && x && qw && n > 0 && d > 0, "Invalid matmul_q8_avx2 parameters");
+    int blocks_per_row = n / Q8_0_BLOCK_SIZE;
+
+#if NC_ENABLE_AVX2_GEMV
+    if (matmul_cpu_supports_avx2_fma()) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < d; j++) {
+            const BlockQ8_0 *row_q8 = qw + (size_t)j * blocks_per_row;
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                const BlockQ8_0 *block = &row_q8[b];
+                const float *x_ptr = x + b * Q8_0_BLOCK_SIZE;
+
+                __m256 vscale = _mm256_set1_ps(block->scale);
+
+                __m128i q16_a = _mm_loadu_si128((const __m128i*)(block->qs));
+                __m128i q16_b = _mm_loadu_si128((const __m128i*)(block->qs + 16));
+
+                __m256i q32_0 = _mm256_cvtepi8_epi32(q16_a);
+                __m256i q32_1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q16_a, 8));
+                __m256i q32_2 = _mm256_cvtepi8_epi32(q16_b);
+                __m256i q32_3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q16_b, 8));
+
+                __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_0), vscale);
+                __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_1), vscale);
+                __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_2), vscale);
+                __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_3), vscale);
+
+                __m256 x0 = _mm256_loadu_ps(x_ptr);
+                __m256 x1 = _mm256_loadu_ps(x_ptr + 8);
+                __m256 x2 = _mm256_loadu_ps(x_ptr + 16);
+                __m256 x3 = _mm256_loadu_ps(x_ptr + 24);
+
+                acc0 = _mm256_fmadd_ps(w0, x0, acc0);
+                acc1 = _mm256_fmadd_ps(w1, x1, acc1);
+                acc0 = _mm256_fmadd_ps(w2, x2, acc0);
+                acc1 = _mm256_fmadd_ps(w3, x3, acc1);
+            }
+
+            __m256 sum_vec = _mm256_add_ps(acc0, acc1);
+            __m128 sum_high = _mm256_extractf128_ps(sum_vec, 1);
+            __m128 sum_low = _mm256_castps256_ps128(sum_vec);
+            __m128 sum128 = _mm_add_ps(sum_low, sum_high);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+
+            float res;
+            _mm_store_ss(&res, sum128);
+            xout[j] = res;
+        }
+        return;
+    }
+#endif
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < d; j++) {
+        const BlockQ8_0 *row_q8 = qw + (size_t)j * blocks_per_row;
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const BlockQ8_0 *block = &row_q8[b];
+            const float *x_ptr = x + b * Q8_0_BLOCK_SIZE;
+            float scale = block->scale;
+            for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
+                sum += (float)block->qs[i] * scale * x_ptr[i];
+            }
+        }
+        xout[j] = sum;
+    }
+}
+
+NC_AVX2_TARGET void matmul_q8_fused_w1w3_avx2(
+    float *xout_w1,
+    float *xout_w3,
+    const float *x,
+    const BlockQ8_0 *qw1,
+    const BlockQ8_0 *qw3,
+    int n,
+    int d
+) {
+    NC_ASSERT(xout_w1 && xout_w3 && x && qw1 && qw3 && n > 0 && d > 0, "Invalid matmul_q8_fused_w1w3_avx2 parameters");
+    int blocks_per_row = n / Q8_0_BLOCK_SIZE;
+
+#if NC_ENABLE_AVX2_GEMV
+    if (matmul_cpu_supports_avx2_fma()) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < d; j++) {
+            const BlockQ8_0 *row1_q8 = qw1 + (size_t)j * blocks_per_row;
+            const BlockQ8_0 *row3_q8 = qw3 + (size_t)j * blocks_per_row;
+
+            __m256 acc1_0 = _mm256_setzero_ps();
+            __m256 acc1_1 = _mm256_setzero_ps();
+            __m256 acc3_0 = _mm256_setzero_ps();
+            __m256 acc3_1 = _mm256_setzero_ps();
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                const float *x_ptr = x + b * Q8_0_BLOCK_SIZE;
+
+                // Load 32 activation floats ONCE into AVX2 registers
+                __m256 x0 = _mm256_loadu_ps(x_ptr);
+                __m256 x1 = _mm256_loadu_ps(x_ptr + 8);
+                __m256 x2 = _mm256_loadu_ps(x_ptr + 16);
+                __m256 x3 = _mm256_loadu_ps(x_ptr + 24);
+
+                // Process W1 Block b
+                const BlockQ8_0 *b1 = &row1_q8[b];
+                __m256 vscale1 = _mm256_set1_ps(b1->scale);
+                __m128i q16_1a = _mm_loadu_si128((const __m128i*)(b1->qs));
+                __m128i q16_1b = _mm_loadu_si128((const __m128i*)(b1->qs + 16));
+
+                __m256 w1_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1a)), vscale1);
+                __m256 w1_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1a, 8))), vscale1);
+                __m256 w1_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1b)), vscale1);
+                __m256 w1_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1b, 8))), vscale1);
+
+                acc1_0 = _mm256_fmadd_ps(w1_0, x0, acc1_0);
+                acc1_1 = _mm256_fmadd_ps(w1_1, x1, acc1_1);
+                acc1_0 = _mm256_fmadd_ps(w1_2, x2, acc1_0);
+                acc1_1 = _mm256_fmadd_ps(w1_3, x3, acc1_1);
+
+                // Process W3 Block b (reusing x0, x1, x2, x3 in registers!)
+                const BlockQ8_0 *b3 = &row3_q8[b];
+                __m256 vscale3 = _mm256_set1_ps(b3->scale);
+                __m128i q16_3a = _mm_loadu_si128((const __m128i*)(b3->qs));
+                __m128i q16_3b = _mm_loadu_si128((const __m128i*)(b3->qs + 16));
+
+                __m256 w3_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_3a)), vscale3);
+                __m256 w3_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_3a, 8))), vscale3);
+                __m256 w3_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_3b)), vscale3);
+                __m256 w3_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_3b, 8))), vscale3);
+
+                acc3_0 = _mm256_fmadd_ps(w3_0, x0, acc3_0);
+                acc3_1 = _mm256_fmadd_ps(w3_1, x1, acc3_1);
+                acc3_0 = _mm256_fmadd_ps(w3_2, x2, acc3_0);
+                acc3_1 = _mm256_fmadd_ps(w3_3, x3, acc3_1);
+            }
+
+            // Horizontal sums for W1
+            __m256 s1_vec = _mm256_add_ps(acc1_0, acc1_1);
+            __m128 s1_high = _mm256_extractf128_ps(s1_vec, 1);
+            __m128 s1_low = _mm256_castps256_ps128(s1_vec);
+            __m128 s1_128 = _mm_add_ps(s1_low, s1_high);
+            s1_128 = _mm_hadd_ps(s1_128, s1_128);
+            s1_128 = _mm_hadd_ps(s1_128, s1_128);
+            float res1;
+            _mm_store_ss(&res1, s1_128);
+            xout_w1[j] = res1;
+
+            // Horizontal sums for W3
+            __m256 s3_vec = _mm256_add_ps(acc3_0, acc3_1);
+            __m128 s3_high = _mm256_extractf128_ps(s3_vec, 1);
+            __m128 s3_low = _mm256_castps256_ps128(s3_vec);
+            __m128 s3_128 = _mm_add_ps(s3_low, s3_high);
+            s3_128 = _mm_hadd_ps(s3_128, s3_128);
+            s3_128 = _mm_hadd_ps(s3_128, s3_128);
+            float res3;
+            _mm_store_ss(&res3, s3_128);
+            xout_w3[j] = res3;
+        }
+        return;
+    }
+#endif
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int j = 0; j < d; j++) {
+        const BlockQ8_0 *row1_q8 = qw1 + (size_t)j * blocks_per_row;
+        const BlockQ8_0 *row3_q8 = qw3 + (size_t)j * blocks_per_row;
+        float sum1 = 0.0f, sum3 = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const float *x_ptr = x + b * Q8_0_BLOCK_SIZE;
+            const BlockQ8_0 *b1 = &row1_q8[b];
+            const BlockQ8_0 *b3 = &row3_q8[b];
+            float s1 = b1->scale, s3 = b3->scale;
+            for (int i = 0; i < Q8_0_BLOCK_SIZE; i++) {
+                float xv = x_ptr[i];
+                sum1 += (float)b1->qs[i] * s1 * xv;
+                sum3 += (float)b3->qs[i] * s3 * xv;
+            }
+        }
+        xout_w1[j] = sum1;
+        xout_w3[j] = sum3;
+    }
+}
+
+NC_AVX2_TARGET void matmul_q8_lm_head_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d) {
+    NC_ASSERT(xout && x && qw && n > 0 && d > 0, "Invalid matmul_q8_lm_head_avx2 parameters");
+    int blocks_per_row = n / Q8_0_BLOCK_SIZE;
+
+#if NC_ENABLE_AVX2_GEMV
+    if (matmul_cpu_supports_avx2_fma()) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < d; j++) {
+            const BlockQ8_0 *row_q8 = qw + (size_t)j * blocks_per_row;
+            _mm_prefetch((const char*)(row_q8 + 8), _MM_HINT_T0);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            for (int b = 0; b < blocks_per_row; b += 2) {
+                _mm_prefetch((const char*)(row_q8 + b + 4), _MM_HINT_T0);
+
+                const float *x_ptr0 = x + b * Q8_0_BLOCK_SIZE;
+                const float *x_ptr1 = x + (b + 1) * Q8_0_BLOCK_SIZE;
+
+                // Block b
+                const BlockQ8_0 *blk0 = &row_q8[b];
+                __m256 vs0 = _mm256_set1_ps(blk0->scale);
+                __m128i q16_0a = _mm_loadu_si128((const __m128i*)(blk0->qs));
+                __m128i q16_0b = _mm_loadu_si128((const __m128i*)(blk0->qs + 16));
+
+                __m256 w0_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_0a)), vs0);
+                __m256 w0_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_0a, 8))), vs0);
+                __m256 w0_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_0b)), vs0);
+                __m256 w0_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_0b, 8))), vs0);
+
+                acc0 = _mm256_fmadd_ps(w0_0, _mm256_loadu_ps(x_ptr0), acc0);
+                acc1 = _mm256_fmadd_ps(w0_1, _mm256_loadu_ps(x_ptr0 + 8), acc1);
+                acc0 = _mm256_fmadd_ps(w0_2, _mm256_loadu_ps(x_ptr0 + 16), acc0);
+                acc1 = _mm256_fmadd_ps(w0_3, _mm256_loadu_ps(x_ptr0 + 24), acc1);
+
+                // Block b+1
+                const BlockQ8_0 *blk1 = &row_q8[b + 1];
+                __m256 vs1 = _mm256_set1_ps(blk1->scale);
+                __m128i q16_1a = _mm_loadu_si128((const __m128i*)(blk1->qs));
+                __m128i q16_1b = _mm_loadu_si128((const __m128i*)(blk1->qs + 16));
+
+                __m256 w1_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1a)), vs1);
+                __m256 w1_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1a, 8))), vs1);
+                __m256 w1_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1b)), vs1);
+                __m256 w1_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1b, 8))), vs1);
+
+                acc0 = _mm256_fmadd_ps(w1_0, _mm256_loadu_ps(x_ptr1), acc0);
+                acc1 = _mm256_fmadd_ps(w1_1, _mm256_loadu_ps(x_ptr1 + 8), acc1);
+                acc0 = _mm256_fmadd_ps(w1_2, _mm256_loadu_ps(x_ptr1 + 16), acc0);
+                acc1 = _mm256_fmadd_ps(w1_3, _mm256_loadu_ps(x_ptr1 + 24), acc1);
+            }
+
+            __m256 sum_vec = _mm256_add_ps(acc0, acc1);
+            __m128 sum_high = _mm256_extractf128_ps(sum_vec, 1);
+            __m128 sum_low = _mm256_castps256_ps128(sum_vec);
+            __m128 sum128 = _mm_add_ps(sum_low, sum_high);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+
+            float res;
+            _mm_store_ss(&res, sum128);
+            xout[j] = res;
+        }
+        return;
+    }
+#endif
+    matmul_q8_avx2(xout, x, qw, n, d);
+}
+
+NC_AVX2_TARGET void matmul_q8_w2_avx2(float *xout, const float *x, const BlockQ8_0 *qw, int n, int d) {
+    NC_ASSERT(xout && x && qw && n > 0 && d > 0, "Invalid matmul_q8_w2_avx2 parameters");
+    int blocks_per_row = n / Q8_0_BLOCK_SIZE;
+
+#if NC_ENABLE_AVX2_GEMV
+    if (matmul_cpu_supports_avx2_fma()) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < d; j++) {
+            const BlockQ8_0 *row_q8 = qw + (size_t)j * blocks_per_row;
+            _mm_prefetch((const char*)(row_q8 + 8), _MM_HINT_T0);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+
+            for (int b = 0; b < blocks_per_row; b += 2) {
+                _mm_prefetch((const char*)(row_q8 + b + 4), _MM_HINT_T0);
+
+                const float *x_ptr0 = x + b * Q8_0_BLOCK_SIZE;
+                const float *x_ptr1 = x + (b + 1) * Q8_0_BLOCK_SIZE;
+
+                // Block b
+                const BlockQ8_0 *blk0 = &row_q8[b];
+                __m256 vs0 = _mm256_set1_ps(blk0->scale);
+                __m128i q16_0a = _mm_loadu_si128((const __m128i*)(blk0->qs));
+                __m128i q16_0b = _mm_loadu_si128((const __m128i*)(blk0->qs + 16));
+
+                __m256 w0_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_0a)), vs0);
+                __m256 w0_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_0a, 8))), vs0);
+                __m256 w0_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_0b)), vs0);
+                __m256 w0_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_0b, 8))), vs0);
+
+                acc0 = _mm256_fmadd_ps(w0_0, _mm256_loadu_ps(x_ptr0), acc0);
+                acc1 = _mm256_fmadd_ps(w0_1, _mm256_loadu_ps(x_ptr0 + 8), acc1);
+                acc0 = _mm256_fmadd_ps(w0_2, _mm256_loadu_ps(x_ptr0 + 16), acc0);
+                acc1 = _mm256_fmadd_ps(w0_3, _mm256_loadu_ps(x_ptr0 + 24), acc1);
+
+                // Block b+1
+                const BlockQ8_0 *blk1 = &row_q8[b + 1];
+                __m256 vs1 = _mm256_set1_ps(blk1->scale);
+                __m128i q16_1a = _mm_loadu_si128((const __m128i*)(blk1->qs));
+                __m128i q16_1b = _mm_loadu_si128((const __m128i*)(blk1->qs + 16));
+
+                __m256 w1_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1a)), vs1);
+                __m256 w1_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1a, 8))), vs1);
+                __m256 w1_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16_1b)), vs1);
+                __m256 w1_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16_1b, 8))), vs1);
+
+                acc0 = _mm256_fmadd_ps(w1_0, _mm256_loadu_ps(x_ptr1), acc0);
+                acc1 = _mm256_fmadd_ps(w1_1, _mm256_loadu_ps(x_ptr1 + 8), acc1);
+                acc0 = _mm256_fmadd_ps(w1_2, _mm256_loadu_ps(x_ptr1 + 16), acc0);
+                acc1 = _mm256_fmadd_ps(w1_3, _mm256_loadu_ps(x_ptr1 + 24), acc1);
+            }
+
+            __m256 sum_vec = _mm256_add_ps(acc0, acc1);
+            __m128 sum_high = _mm256_extractf128_ps(sum_vec, 1);
+            __m128 sum_low = _mm256_castps256_ps128(sum_vec);
+            __m128 sum128 = _mm_add_ps(sum_low, sum_high);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+
+            float res;
+            _mm_store_ss(&res, sum128);
+            xout[j] = res;
+        }
+        return;
+    }
+#endif
+    matmul_q8_avx2(xout, x, qw, n, d);
+}
+
+NC_AVX2_TARGET void matmul_q4_0_wcls_avx2(float *xout, const float *x, const BlockQ4_0 *qw, int n, int d) {
+    NC_ASSERT(xout && x && qw && n > 0 && d > 0, "Invalid matmul_q4_0_wcls_avx2 parameters");
+    int blocks_per_row = n / Q4_0_BLOCK_SIZE;
+
+#if NC_ENABLE_AVX2_GEMV
+    if (matmul_cpu_supports_avx2_fma()) {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int j = 0; j < d; j++) {
+            const BlockQ4_0 *row_q4 = qw + (size_t)j * blocks_per_row;
+            _mm_prefetch((const char*)(row_q4 + 8), _MM_HINT_T0);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i offset_8 = _mm_set1_epi8(8);
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                const BlockQ4_0 *blk = &row_q4[b];
+                const float *x_ptr = x + b * Q4_0_BLOCK_SIZE;
+
+                __m256 vscale = _mm256_set1_ps(blk->scale);
+
+                // Load 16 uint8 bytes (32 4-bit nibbles)
+                __m128i q16 = _mm_loadu_si128((const __m128i*)blk->qs);
+
+                // Extract low 16 weights (low nibbles)
+                __m128i q_low = _mm_sub_epi8(_mm_and_si128(q16, low_mask), offset_8);
+                // Extract high 16 weights (high nibbles)
+                __m128i q_high = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(q16, 4), low_mask), offset_8);
+
+                // Expand q_low to 256-bit floats
+                __m256i q32_l0 = _mm256_cvtepi8_epi32(q_low);
+                __m256i q32_l1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_low, 8));
+
+                __m256 w0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_l0), vscale);
+                __m256 w1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_l1), vscale);
+
+                // Expand q_high to 256-bit floats
+                __m256i q32_h0 = _mm256_cvtepi8_epi32(q_high);
+                __m256i q32_h1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_high, 8));
+
+                __m256 w2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_h0), vscale);
+                __m256 w3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q32_h1), vscale);
+
+                acc0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x_ptr), acc0);
+                acc1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x_ptr + 8), acc1);
+                acc0 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(x_ptr + 16), acc0);
+                acc1 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(x_ptr + 24), acc1);
+            }
+
+            __m256 sum_vec = _mm256_add_ps(acc0, acc1);
+            __m128 sum_high = _mm256_extractf128_ps(sum_vec, 1);
+            __m128 sum_low = _mm256_castps256_ps128(sum_vec);
+            __m128 sum128 = _mm_add_ps(sum_low, sum_high);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+
+            float res;
+            _mm_store_ss(&res, sum128);
+            xout[j] = res;
+        }
+        return;
+    }
+#endif
+    // Scalar fallback
+    for (int j = 0; j < d; j++) {
+        const BlockQ4_0 *row_q4 = qw + (size_t)j * blocks_per_row;
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const BlockQ4_0 *blk = &row_q4[b];
+            const float *x_ptr = x + b * Q4_0_BLOCK_SIZE;
+            float s = blk->scale;
+            for (int i = 0; i < 16; i++) {
+                int v0 = (int)(blk->qs[i] & 0x0F) - 8;
+                int v1 = (int)((blk->qs[i] >> 4) & 0x0F) - 8;
+                sum += (float)v0 * s * x_ptr[i * 2 + 0];
+                sum += (float)v1 * s * x_ptr[i * 2 + 1];
+            }
+        }
+        xout[j] = sum;
     }
 }
